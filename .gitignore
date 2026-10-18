@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+!payload/pixel_lyrics_util.cpython-39.pyc
+
+build/
+dist/
+*.spec
+runtime39/
+python-3.9.13-embed-amd64.zip
+
+.venv/
+.idea/
+.vscode/
+*.log
+*.tmp
