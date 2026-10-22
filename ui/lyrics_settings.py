@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
+import time
 import urllib.request
 from pathlib import Path
 
@@ -61,6 +63,35 @@ def api_post(path: str, payload: dict, timeout: float = 5.0):
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def ensure_tempo_hub_running():
+    try:
+        api_get("/api/state", timeout=0.8)
+        return True
+    except Exception:
+        pass
+
+    executable = APP_DIR / "EDIFIER TempoHub.exe"
+    if executable.is_file():
+        try:
+            subprocess.Popen(
+                [str(executable)],
+                cwd=str(APP_DIR),
+                close_fds=True,
+            )
+        except Exception:
+            return False
+
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        time.sleep(0.35)
+        try:
+            api_get("/api/state", timeout=0.8)
+            return True
+        except Exception:
+            continue
+    return False
 
 
 def format_seconds(value):
@@ -626,6 +657,7 @@ class SettingsWindow(QMainWindow):
 
 
 def main():
+    ensure_tempo_hub_running()
     app = QApplication(sys.argv)
     app.setApplicationName("Halo PixelBar 歌词控制台")
     window = SettingsWindow()
