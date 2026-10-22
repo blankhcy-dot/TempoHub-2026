@@ -9,6 +9,7 @@ import json
 import os
 import queue
 import re
+import subprocess
 import tempfile
 import threading
 import time
@@ -68,6 +69,7 @@ _CANVAS_LAST_START = 0.0
 _PROTOCOL_LOGGING_INSTALLED = False
 _NETEASE_API_LOCK = threading.Lock()
 _NETEASE_API_BLOCK_UNTIL = 0.0
+_NETEASE_START_LOCK = threading.Lock()
 
 _DEFAULT_SETTINGS = {
     "enabled": True,
@@ -319,6 +321,63 @@ def _start_netease_progress_bridge():
         name="netease-progress-bridge",
     )
     _NETEASE_PROGRESS_THREAD.start()
+
+
+def _ensure_netease_running_safe():
+    try:
+        with urllib.request.urlopen(
+            f"{_NETEASE_CDP_URL}/json/list", timeout=0.8
+        ):
+            return
+    except Exception:
+        pass
+
+    with _NETEASE_START_LOCK:
+        try:
+            process_list = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq cloudmusic.exe", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if "cloudmusic.exe" in (process_list.stdout or "").casefold():
+                return
+        except Exception:
+            return
+
+        candidates = [
+            os.path.join(
+                os.environ.get("ProgramFiles", ""),
+                "NetEase",
+                "CloudMusic",
+                "cloudmusic.exe",
+            ),
+            os.path.join(
+                os.environ.get("ProgramFiles(x86)", ""),
+                "NetEase",
+                "CloudMusic",
+                "cloudmusic.exe",
+            ),
+        ]
+        executable = next(
+            (path for path in candidates if path and os.path.isfile(path)),
+            None,
+        )
+        if executable is None:
+            _log("netease_autostart_missing")
+            return
+        try:
+            subprocess.Popen(
+                [executable, "--remote-debugging-port=9222"],
+                cwd=os.path.dirname(executable),
+                close_fds=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            _log("netease_autostarted", executable=executable)
+        except Exception as error:
+            _log("netease_autostart_error", error=str(error))
 
 
 def _ensure_cdp_lyrics(sample):
@@ -1163,6 +1222,7 @@ def _start(self):
         _log("canvas_timer_started")
         QTimer.singleShot(2000, _ensure_canvas_model_safe)
         QTimer.singleShot(3000, _ensure_native_lyrics_safe)
+        QTimer.singleShot(1200, _ensure_netease_running_safe)
     return _original_start(self)
 
 
