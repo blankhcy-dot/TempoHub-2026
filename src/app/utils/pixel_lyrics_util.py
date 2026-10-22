@@ -380,13 +380,30 @@ def _ensure_netease_running_safe():
             _log("netease_autostart_error", error=str(error))
 
 
+def _netease_sample_matches(sample, title, artist):
+    sample_title = _normalize_text(sample.get("title"))
+    wanted_title = _normalize_text(title)
+    if not sample_title or sample_title != wanted_title:
+        return False
+    sample_artist = _normalize_text(sample.get("artist"))
+    wanted_artist = _normalize_text(artist)
+    if not sample_artist or not wanted_artist:
+        return True
+    return (
+        sample_artist == wanted_artist
+        or sample_artist in wanted_artist
+        or wanted_artist in sample_artist
+    )
+
+
 def _ensure_cdp_lyrics(sample):
     monitor = _ACTIVE_MONITOR
     title = str(sample.get("title") or "").strip()
     artist = str(sample.get("artist") or "").strip()
+    track_id = str(sample.get("track_id") or "").strip()
     if monitor is None or not title:
         return
-    title_key = (_normalize_text(title), _normalize_text(artist))
+    title_key = (_normalize_text(title), _normalize_text(artist), track_id)
     now = time.time()
     if now < float(getattr(monitor, "_netease_cdp_fetching_until", 0.0) or 0.0):
         return
@@ -407,7 +424,7 @@ def _ensure_cdp_lyrics(sample):
     monitor._last_title = title
     monitor._last_artist = artist
     monitor._netease_album = str(sample.get("album") or "")
-    monitor._netease_track_id = str(sample.get("track_id") or "")
+    monitor._netease_track_id = track_id
     monitor._current_timeline = []
     monitor._netease_timeline_times = []
     monitor._netease_base_timeline = []
@@ -421,11 +438,12 @@ def _ensure_cdp_lyrics(sample):
                 title,
                 artist,
                 sample.get("duration"),
+                sample,
             )
-            monitor._evt_total_duration = sample.get("duration")
-            monitor._evt_position = sample.get("position")
-            monitor._evt_position_time = time.time()
             if getattr(monitor, "_current_timeline", None):
+                monitor._evt_total_duration = sample.get("duration")
+                monitor._evt_position = sample.get("position")
+                monitor._evt_position_time = time.time()
                 monitor._netease_cdp_failed_key = None
                 monitor._netease_cdp_retry_after = 0.0
             else:
@@ -1306,10 +1324,27 @@ async def _handle_media_change(self):
     return await _original_handle_media_change(self)
 
 
-def _fetch_and_parse_lyric_sync(self, title, artist, duration):
+def _fetch_and_parse_lyric_sync(
+    self,
+    title,
+    artist,
+    duration,
+    netease_sample=None,
+):
     if getattr(self, "_netease_source_active", False):
         try:
-            track_id = str(getattr(self, "_netease_track_id", "") or "")
+            sample = netease_sample or _netease_progress_snapshot()
+            if not _netease_sample_matches(sample, title, artist):
+                _log(
+                    "netease_stale_media_skipped",
+                    title=title,
+                    artist=artist,
+                    sample_title=sample.get("title"),
+                    sample_artist=sample.get("artist"),
+                )
+                return None
+            track_id = str(sample.get("track_id") or "")
+            self._netease_track_id = track_id
             if track_id:
                 result = _fetch_netease_lyric_by_id(
                     track_id,
@@ -1326,6 +1361,20 @@ def _fetch_and_parse_lyric_sync(self, title, artist, duration):
                 )
             if result:
                 lyric, _song = result
+                current_sample = _netease_progress_snapshot()
+                if (
+                    not _netease_sample_matches(current_sample, title, artist)
+                    or str(current_sample.get("track_id") or "") != track_id
+                ):
+                    _log(
+                        "netease_stale_lyrics_discarded",
+                        title=title,
+                        artist=artist,
+                        requested_track_id=track_id,
+                        current_track_id=current_sample.get("track_id"),
+                        current_title=current_sample.get("title"),
+                    )
+                    return None
                 timeline = parse_lrc_to_timeline(lyric)
                 if timeline:
                     self._netease_base_timeline = list(timeline)
