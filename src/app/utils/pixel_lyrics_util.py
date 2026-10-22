@@ -53,6 +53,10 @@ _CANVAS_TIMER = None
 _NETEASE_PROGRESS = {
     "position": None,
     "duration": None,
+    "title": "",
+    "artist": "",
+    "album": "",
+    "track_id": "",
     "text": "",
     "updated": 0.0,
     "error": None,
@@ -62,6 +66,8 @@ _NETEASE_PROGRESS_THREAD = None
 _NETEASE_CDP_URL = "http://127.0.0.1:9222"
 _CANVAS_LAST_START = 0.0
 _PROTOCOL_LOGGING_INSTALLED = False
+_NETEASE_API_LOCK = threading.Lock()
+_NETEASE_API_BLOCK_UNTIL = 0.0
 
 _DEFAULT_SETTINGS = {
     "enabled": True,
@@ -200,16 +206,42 @@ def _read_netease_progress():
     import websocket
 
     expression = """
-    (() => {
+    (async () => {
       const node = document.querySelector('.curtime-thumb');
       if (!node) return {text: '', found: false};
       const text = (node.innerText || node.textContent || '').trim();
-      return {text, found: true};
+      let track = null;
+      try {
+        const raw = localStorage.getItem('playingInfo');
+        if (raw && typeof channel !== 'undefined' && channel.deData) {
+          const decoded = await channel.deData(raw);
+          const text = typeof decoded === 'string'
+            ? decoded
+            : (decoded?.data || String(decoded));
+          const data = JSON.parse(text);
+          track = data?.curTrack || data?.curPlaying?.track || null;
+        }
+      } catch (_) {}
+      const title = String(track?.name || (
+        document.querySelector('.main-title')?.innerText || ''
+      )).trim();
+      const artist = String(
+        (track?.artists || []).map(item => item?.name || '').filter(Boolean).join(' / ')
+        || (
+        document.querySelector('.title-container .author')?.innerText || ''
+        )
+      ).trim();
+      const album = String(track?.album?.name || '').trim();
+      const trackId = String(track?.id || '').trim();
+      const duration = Number(track?.duration) > 0
+        ? Number(track.duration) / 1000
+        : null;
+      return {text, title, artist, album, trackId, duration, found: true};
     })()
     """
     connection = websocket.create_connection(
         target["webSocketDebuggerUrl"],
-        timeout=1.2,
+        timeout=2.5,
         suppress_origin=True,
     )
     try:
@@ -238,7 +270,15 @@ def _read_netease_progress():
                 raise RuntimeError(f"无法从网易云播放器读取进度: {text!r}")
             return {
                 "position": float(values[0]),
-                "duration": float(values[1]) if len(values) > 1 else None,
+                "duration": (
+                    float(value["duration"])
+                    if value.get("duration") is not None
+                    else float(values[1]) if len(values) > 1 else None
+                ),
+                "title": str(value.get("title") or ""),
+                "artist": str(value.get("artist") or ""),
+                "album": str(value.get("album") or ""),
+                "track_id": str(value.get("trackId") or ""),
                 "text": text,
             }
     finally:
@@ -254,6 +294,7 @@ def _netease_progress_worker():
                 _NETEASE_PROGRESS.update(sample)
                 _NETEASE_PROGRESS["updated"] = time.time()
                 _NETEASE_PROGRESS["error"] = None
+            _ensure_cdp_lyrics(sample)
             if error_logged:
                 _log("netease_progress_recovered")
                 error_logged = None
@@ -278,6 +319,67 @@ def _start_netease_progress_bridge():
         name="netease-progress-bridge",
     )
     _NETEASE_PROGRESS_THREAD.start()
+
+
+def _ensure_cdp_lyrics(sample):
+    monitor = _ACTIVE_MONITOR
+    title = str(sample.get("title") or "").strip()
+    artist = str(sample.get("artist") or "").strip()
+    if monitor is None or not title:
+        return
+    title_key = (_normalize_text(title), _normalize_text(artist))
+    now = time.time()
+    if now < float(getattr(monitor, "_netease_cdp_fetching_until", 0.0) or 0.0):
+        return
+    if (
+        title_key == getattr(monitor, "_netease_cdp_failed_key", None)
+        and now < float(getattr(monitor, "_netease_cdp_retry_after", 0.0) or 0.0)
+    ):
+        return
+    if (
+        title_key == getattr(monitor, "_netease_cdp_lyric_key", None)
+        and getattr(monitor, "_current_timeline", None)
+    ):
+        return
+
+    monitor._netease_cdp_lyric_key = title_key
+    monitor._netease_cdp_fetching_until = now + 6.0
+    monitor._netease_source_active = True
+    monitor._last_title = title
+    monitor._last_artist = artist
+    monitor._netease_album = str(sample.get("album") or "")
+    monitor._netease_track_id = str(sample.get("track_id") or "")
+    monitor._current_timeline = []
+    monitor._netease_timeline_times = []
+    monitor._netease_base_timeline = []
+    monitor._netease_line_index = None
+    monitor._last_lyric_line = None
+    monitor._netease_wait_until = now + 0.6
+
+    def fetch_worker():
+        try:
+            monitor._fetch_and_parse_lyric_sync(
+                title,
+                artist,
+                sample.get("duration"),
+            )
+            monitor._evt_total_duration = sample.get("duration")
+            monitor._evt_position = sample.get("position")
+            monitor._evt_position_time = time.time()
+            if getattr(monitor, "_current_timeline", None):
+                monitor._netease_cdp_failed_key = None
+                monitor._netease_cdp_retry_after = 0.0
+            else:
+                monitor._netease_cdp_failed_key = title_key
+                monitor._netease_cdp_retry_after = time.time() + 90.0
+        finally:
+            monitor._netease_cdp_fetching_until = 0.0
+
+    threading.Thread(
+        target=fetch_worker,
+        daemon=True,
+        name="netease-cdp-lyrics",
+    ).start()
 
 
 def _netease_progress_snapshot(playing=None):
@@ -744,10 +846,29 @@ def _start_local_api():
 
 
 def _http_json(url, timeout=8):
+    global _NETEASE_API_BLOCK_UNTIL
+    is_search_request = url.startswith(_SEARCH_URL)
+    if is_search_request:
+        with _NETEASE_API_LOCK:
+            blocked_until = _NETEASE_API_BLOCK_UNTIL
+        if time.time() < blocked_until:
+            raise RuntimeError("网易云歌词接口暂时限流，稍后自动重试")
     request = urllib.request.Request(url, headers=_HEADERS)
     with urllib.request.urlopen(request, timeout=timeout) as response:
         body = response.read().decode("utf-8", "replace")
-    return json.loads(body)
+    data = json.loads(body)
+    if is_search_request and int(data.get("code", 200) or 200) in (
+        405,
+        429,
+    ):
+        with _NETEASE_API_LOCK:
+            _NETEASE_API_BLOCK_UNTIL = max(
+                _NETEASE_API_BLOCK_UNTIL,
+                time.time() + 90.0,
+            )
+        _log("netease_rate_limited", code=data.get("code"))
+        raise RuntimeError("网易云歌词接口限流，已暂停请求 90 秒")
+    return data
 
 
 def _normalize_text(value):
@@ -901,6 +1022,28 @@ def _fetch_netease_lyric(title, artist, duration, album=""):
     if not lyric.strip() or (data.get("nolyric") or data.get("uncollected")):
         return None
     return lyric, song
+
+
+def _fetch_netease_lyric_by_id(track_id, title="", artist="", duration=None):
+    if not track_id:
+        return None
+    params = urllib.parse.urlencode(
+        {"id": track_id, "lv": -1, "kv": -1, "tv": -1}
+    )
+    data = _http_json(f"{_LYRIC_URL}?{params}")
+    if data.get("code") != 200:
+        return None
+    lyric = (data.get("lrc") or {}).get("lyric") or ""
+    if not lyric.strip():
+        lyric = (data.get("tlyric") or {}).get("lyric") or ""
+    if not lyric.strip() or data.get("nolyric") or data.get("uncollected"):
+        return None
+    return lyric, {
+        "id": track_id,
+        "name": title,
+        "duration": float(duration) * 1000 if duration else None,
+        "artists": [{"name": artist}] if artist else [],
+    }
 
 
 _original_handle_media_change = PixelLyricsMonitor._handle_media_change
@@ -1106,12 +1249,21 @@ async def _handle_media_change(self):
 def _fetch_and_parse_lyric_sync(self, title, artist, duration):
     if getattr(self, "_netease_source_active", False):
         try:
-            result = _fetch_netease_lyric(
-                title,
-                artist,
-                duration,
-                getattr(self, "_netease_album", ""),
-            )
+            track_id = str(getattr(self, "_netease_track_id", "") or "")
+            if track_id:
+                result = _fetch_netease_lyric_by_id(
+                    track_id,
+                    title,
+                    artist,
+                    duration,
+                )
+            else:
+                result = _fetch_netease_lyric(
+                    title,
+                    artist,
+                    duration,
+                    getattr(self, "_netease_album", ""),
+                )
             if result:
                 lyric, _song = result
                 timeline = parse_lrc_to_timeline(lyric)

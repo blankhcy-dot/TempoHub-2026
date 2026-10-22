@@ -94,6 +94,53 @@ def ensure_tempo_hub_running():
     return False
 
 
+def ensure_netease_running():
+    try:
+        with urllib.request.urlopen(
+            "http://127.0.0.1:9222/json/list", timeout=0.8
+        ):
+            return True
+    except Exception:
+        pass
+
+    existing = subprocess.run(
+        ["tasklist", "/FI", "IMAGENAME eq cloudmusic.exe", "/NH"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if "cloudmusic.exe" in existing.stdout.casefold():
+        return False
+
+    candidates = [
+        Path(os.environ.get("ProgramFiles", "")) / "NetEase/CloudMusic/cloudmusic.exe",
+        Path(os.environ.get("ProgramFiles(x86)", "")) / "NetEase/CloudMusic/cloudmusic.exe",
+    ]
+    executable = next((path for path in candidates if path.is_file()), None)
+    if executable is None:
+        return False
+    try:
+        subprocess.Popen(
+            [str(executable), "--remote-debugging-port=9222"],
+            cwd=str(executable.parent),
+            close_fds=True,
+        )
+    except Exception:
+        return False
+
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        time.sleep(0.4)
+        try:
+            with urllib.request.urlopen(
+                "http://127.0.0.1:9222/json/list", timeout=0.8
+            ):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def format_seconds(value):
     if value is None:
         return "--:--"
@@ -658,6 +705,7 @@ class SettingsWindow(QMainWindow):
 
 def main():
     ensure_tempo_hub_running()
+    ensure_netease_running()
     app = QApplication(sys.argv)
     app.setApplicationName("Halo PixelBar 歌词控制台")
     window = SettingsWindow()
