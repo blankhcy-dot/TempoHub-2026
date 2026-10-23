@@ -70,6 +70,8 @@ _PROTOCOL_LOGGING_INSTALLED = False
 _NETEASE_API_LOCK = threading.Lock()
 _NETEASE_API_BLOCK_UNTIL = 0.0
 _NETEASE_START_LOCK = threading.Lock()
+_NETEASE_START_ATTEMPTED = False
+_NETEASE_MODULE_STARTED_AT = time.monotonic()
 
 _DEFAULT_SETTINGS = {
     "enabled": True,
@@ -307,6 +309,8 @@ def _netease_progress_worker():
             if message != error_logged:
                 _log("netease_progress_error", error=message)
                 error_logged = message
+            if time.monotonic() - _NETEASE_MODULE_STARTED_AT >= 12.0:
+                _ensure_netease_running_safe()
             time.sleep(2.0)
         time.sleep(0.25)
 
@@ -323,29 +327,95 @@ def _start_netease_progress_bridge():
     _NETEASE_PROGRESS_THREAD.start()
 
 
+def _cloudmusic_is_running():
+    try:
+        process_list = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq cloudmusic.exe", "/NH"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return "cloudmusic.exe" in (process_list.stdout or "").casefold()
+    except Exception:
+        return False
+
+
+def _wait_for_netease_cdp(timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(
+                f"{_NETEASE_CDP_URL}/json/list", timeout=0.8
+            ):
+                return True
+        except Exception:
+            time.sleep(0.35)
+    return False
+
+
+def _stop_cloudmusic_processes(executable):
+    script = (
+        "$target=[IO.Path]::GetFullPath($env:TEMPO_NETEASE_EXE);"
+        "Get-CimInstance Win32_Process -Filter \"Name='cloudmusic.exe'\" | "
+        "Where-Object { $_.ExecutablePath -and "
+        "([IO.Path]::GetFullPath($_.ExecutablePath) -eq $target) } | "
+        "ForEach-Object { Stop-Process -Id $_.ProcessId -Force "
+        "-ErrorAction SilentlyContinue }"
+    )
+    environment = os.environ.copy()
+    environment["TEMPO_NETEASE_EXE"] = executable
+    subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=8,
+        check=False,
+        env=environment,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    deadline = time.monotonic() + 6.0
+    while _cloudmusic_is_running() and time.monotonic() < deadline:
+        time.sleep(0.2)
+
+
 def _ensure_netease_running_safe():
+    global _NETEASE_START_ATTEMPTED
     try:
         with urllib.request.urlopen(
             f"{_NETEASE_CDP_URL}/json/list", timeout=0.8
         ):
-            return
+            return True
     except Exception:
         pass
 
     with _NETEASE_START_LOCK:
         try:
-            process_list = subprocess.run(
-                ["tasklist", "/FI", "IMAGENAME eq cloudmusic.exe", "/NH"],
-                capture_output=True,
-                text=True,
-                timeout=3,
-                check=False,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            if "cloudmusic.exe" in (process_list.stdout or "").casefold():
-                return
+            with urllib.request.urlopen(
+                f"{_NETEASE_CDP_URL}/json/list", timeout=0.8
+            ):
+                return True
         except Exception:
-            return
+            pass
+
+        cloudmusic_running = _cloudmusic_is_running()
+        if (
+            cloudmusic_running
+            and _NETEASE_START_ATTEMPTED
+        ):
+            return False
+        if (
+            cloudmusic_running
+            and time.monotonic() - _NETEASE_MODULE_STARTED_AT < 12.0
+        ):
+            return False
 
         candidates = [
             os.path.join(
@@ -367,7 +437,17 @@ def _ensure_netease_running_safe():
         )
         if executable is None:
             _log("netease_autostart_missing")
-            return
+            return False
+
+        _NETEASE_START_ATTEMPTED = True
+        if cloudmusic_running:
+            _log("netease_restarting_without_cdp", executable=executable)
+            try:
+                _stop_cloudmusic_processes(executable)
+            except Exception as error:
+                _log("netease_restart_stop_error", error=str(error))
+                return False
+
         try:
             subprocess.Popen(
                 [executable, "--remote-debugging-port=9222"],
@@ -375,9 +455,24 @@ def _ensure_netease_running_safe():
                 close_fds=True,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-            _log("netease_autostarted", executable=executable)
+            event = (
+                "netease_restarted_with_cdp"
+                if cloudmusic_running
+                else "netease_autostarted"
+            )
+            _log(event, executable=executable)
         except Exception as error:
             _log("netease_autostart_error", error=str(error))
+            return False
+        return _wait_for_netease_cdp(12.0)
+
+
+def _ensure_netease_running_async():
+    threading.Thread(
+        target=_ensure_netease_running_safe,
+        daemon=True,
+        name="netease-autostart",
+    ).start()
 
 
 def _netease_sample_matches(sample, title, artist):
@@ -909,6 +1004,20 @@ class _LocalApiHandler(BaseHTTPRequestHandler):
             except Exception as error:
                 self._send(500, {"error": str(error)})
             return
+        if self.path == "/api/ensure-netease":
+            ready = _ensure_netease_running_safe()
+            self._send(
+                200,
+                {
+                    "ready": bool(ready),
+                    "error": (
+                        None
+                        if ready
+                        else "网易云同步端口未就绪"
+                    ),
+                },
+            )
+            return
         self._send(404, {"error": "not found"})
 
 
@@ -1240,7 +1349,7 @@ def _start(self):
         _log("canvas_timer_started")
         QTimer.singleShot(2000, _ensure_canvas_model_safe)
         QTimer.singleShot(3000, _ensure_native_lyrics_safe)
-        QTimer.singleShot(1200, _ensure_netease_running_safe)
+        QTimer.singleShot(1200, _ensure_netease_running_async)
     return _original_start(self)
 
 

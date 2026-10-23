@@ -103,6 +103,12 @@ def ensure_netease_running():
     except Exception:
         pass
 
+    try:
+        result = api_post("/api/ensure-netease", {}, timeout=15.0)
+        return bool(result.get("ready"))
+    except Exception:
+        pass
+
     existing = subprocess.run(
         ["tasklist", "/FI", "IMAGENAME eq cloudmusic.exe", "/NH"],
         capture_output=True,
