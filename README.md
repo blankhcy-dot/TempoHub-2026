@@ -21,6 +21,7 @@
 - 音频频谱使用 Windows WASAPI 系统输出回环，支持柱状频谱、波形和双 VU 表。
 - 消息通知支持微信、QQ 和 QQ 邮箱；优先使用 Windows 通知中心，并回退到未读窗口标题检测。
 - 游戏性能页显示 FPS、CPU、GPU、GPU 温度、内存及四条历史曲线。
+- 音效调优页可直接切换设备硬件 Music / Game / Movie 模式，并说明各模式的听感取向。
 
 ## 安装
 
@@ -65,6 +66,8 @@ python installer.py --app-dir "C:\Program Files (x86)\EDIFIER TempoHub"
 - 设置保存在 `%APPDATA%\TempoHubLyrics\settings.json`。
 - FPS 由随安装包提供的 Intel PresentMon 采集，首次启用需要一次 Windows 管理员授权。
 - CPU 温度取决于主板驱动权限；无法读取时会显示 `--`，其他性能指标不受影响。
+- Halo PixelBar 当前固件只开放三个硬件 EQ 预设，不响应自定义频段 EQ 查询，
+  因此控制台不会提供无效的自定义均衡器滑杆。
 
 ## 卸载
 

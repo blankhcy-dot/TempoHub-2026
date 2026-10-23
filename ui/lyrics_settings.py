@@ -27,10 +27,13 @@ from PyQt6.QtGui import (
     QFontMetricsF,
     QImage,
     QPainter,
+    QPainterPath,
+    QPen,
     QPixmap,
 )
 from PyQt6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QFrame,
@@ -299,6 +302,78 @@ class MatrixPreview(QLabel):
         self.setPixmap(pixmap)
 
 
+class ToneCurvePreview(QLabel):
+    def __init__(self):
+        super().__init__()
+        self.setFixedSize(520, 230)
+        self.setStyleSheet(
+            "background:#050809; border:1px solid #20262c; border-radius:12px;"
+        )
+        self.mode = 0
+        self.render_curve()
+
+    def set_mode(self, mode):
+        self.mode = max(0, min(2, int(mode)))
+        self.render_curve()
+
+    def render_curve(self):
+        image = QImage(520, 230, QImage.Format.Format_RGB32)
+        image.fill(QColor("#050809"))
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        plot = QRectF(42, 28, 450, 148)
+        painter.setPen(QPen(QColor("#293238"), 1))
+        painter.drawRect(plot)
+        painter.drawLine(
+            int(plot.left()),
+            int(plot.center().y()),
+            int(plot.right()),
+            int(plot.center().y()),
+        )
+        for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
+            x = plot.left() + plot.width() * fraction
+            painter.drawLine(
+                int(x),
+                int(plot.top()),
+                int(x),
+                int(plot.bottom()),
+            )
+        curves = {
+            0: [0.0, 0.8, 1.0, 0.9, 0.3, -0.2],
+            1: [-0.8, -0.4, 0.3, 1.5, 1.2, 0.4],
+            2: [2.3, 1.6, 0.2, 0.8, 1.3, 1.8],
+        }
+        colors = {
+            0: QColor("#54e69a"),
+            1: QColor("#58c8ff"),
+            2: QColor("#ffb85c"),
+        }
+        values = curves[self.mode]
+        path = QPainterPath()
+        for index, value in enumerate(values):
+            x = plot.left() + plot.width() * index / (len(values) - 1)
+            y = plot.center().y() - value * 24
+            if index == 0:
+                path.moveTo(x, y)
+            else:
+                path.lineTo(x, y)
+        painter.setPen(QPen(colors[self.mode], 3))
+        painter.drawPath(path)
+        labels = ("60", "250", "1k", "3k", "8k", "16k")
+        painter.setFont(QFont("Consolas", 8))
+        painter.setPen(QColor("#7f8a92"))
+        for index, label in enumerate(labels):
+            x = plot.left() + plot.width() * index / (len(labels) - 1)
+            painter.drawText(QRectF(x - 24, plot.bottom() + 8, 48, 18), int(Qt.AlignmentFlag.AlignCenter.value), label)
+        painter.drawText(
+            QRectF(12, 5, 496, 18),
+            int(Qt.AlignmentFlag.AlignLeft.value),
+            "调音设计意图 · 非设备频响实测",
+        )
+        painter.end()
+        self.setPixmap(QPixmap.fromImage(image))
+
+
 class SettingsWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -319,6 +394,7 @@ class SettingsWindow(QMainWindow):
             "perf_show_cpu": True,
             "perf_show_gpu": True,
             "perf_show_memory": True,
+            "sound_mode": 0,
         }
         self._suppress_offset_change = False
         self._suppress_scene_change = True
@@ -486,6 +562,11 @@ class SettingsWindow(QMainWindow):
                 padding:10px 20px;
             }
             QPushButton#primary:hover { background:#56ECA0; }
+            QPushButton:checked {
+                background:#16271E;
+                color:#62E79E;
+                border:1px solid #28513A;
+            }
             QPushButton#quiet {
                 background:transparent;
                 border:0;
@@ -592,7 +673,7 @@ class SettingsWindow(QMainWindow):
         nav_layout.addWidget(nav_hint)
         self.nav = QListWidget()
         self.nav.setObjectName("sceneNav")
-        for text in ("歌词", "音频频谱", "消息通知", "游戏性能"):
+        for text in ("歌词", "音频频谱", "消息通知", "游戏性能", "音效调优"):
             self.nav.addItem(text)
         self.nav.setCurrentRow(0)
         nav_layout.addWidget(self.nav, 1)
@@ -750,9 +831,11 @@ class SettingsWindow(QMainWindow):
         self.performance_page, self.performance_preview = (
             self._build_performance_page()
         )
+        self.sound_page = self._build_sound_page()
         self.pages.addWidget(self.audio_page)
         self.pages.addWidget(self.notification_page)
         self.pages.addWidget(self.performance_page)
+        self.pages.addWidget(self.sound_page)
 
         self.offset.valueChanged.connect(self._on_offset_changed)
         self.offset.sliderReleased.connect(self._apply_offset)
@@ -994,7 +1077,151 @@ class SettingsWindow(QMainWindow):
         layout.addWidget(controls, 2)
         return page, preview
 
+    def _build_sound_page(self):
+        page = QWidget()
+        layout = QHBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(16)
+
+        preview_card = self._card()
+        preview_layout = QVBoxLayout(preview_card)
+        preview_layout.setContentsMargins(26, 22, 26, 22)
+        preview_layout.setSpacing(12)
+        eyebrow = QLabel("HARDWARE SOUND")
+        eyebrow.setObjectName("eyebrow")
+        preview_layout.addWidget(eyebrow)
+        title = QLabel("音效调优")
+        title.setObjectName("songTitle")
+        preview_layout.addWidget(title)
+        hint = QLabel(
+            "直接切换 Halo PixelBar 的硬件 DSP 预设。曲线仅用于解释调音方向，不代表实测频响。"
+        )
+        hint.setObjectName("muted")
+        hint.setWordWrap(True)
+        preview_layout.addWidget(hint)
+        self.sound_curve = ToneCurvePreview()
+        preview_layout.addWidget(self.sound_curve)
+        preview_layout.addWidget(self._divider())
+        self.sound_mode_title = QLabel("音乐模式")
+        self.sound_mode_title.setObjectName("lyric")
+        preview_layout.addWidget(self.sound_mode_title)
+        self.sound_mode_detail = QLabel(
+            "相对均衡，人声和乐器兼顾，适合流行、女声、播客和长时间聆听。"
+        )
+        self.sound_mode_detail.setObjectName("muted")
+        self.sound_mode_detail.setWordWrap(True)
+        preview_layout.addWidget(self.sound_mode_detail)
+        preview_layout.addStretch()
+        self.sound_capability = QLabel("正在读取设备 EQ 能力…")
+        self.sound_capability.setObjectName("chipMuted")
+        preview_layout.addWidget(
+            self.sound_capability, 0, Qt.AlignmentFlag.AlignLeft
+        )
+        layout.addWidget(preview_card, 3)
+
+        controls = self._card()
+        controls_layout = QVBoxLayout(controls)
+        controls_layout.setContentsMargins(24, 22, 24, 20)
+        controls_layout.setSpacing(10)
+        control_eyebrow = QLabel("LISTENING MODE")
+        control_eyebrow.setObjectName("eyebrow")
+        controls_layout.addWidget(control_eyebrow)
+        control_title = QLabel("选择硬件模式")
+        control_title.setObjectName("section")
+        controls_layout.addWidget(control_title)
+
+        self.sound_group = QButtonGroup(self)
+        self.sound_group.setExclusive(True)
+        self.sound_buttons = []
+        texts = (
+            "音乐  ·  均衡自然\n人声 / 流行 / 长时间聆听",
+            "游戏  ·  定位清晰\n脚步、方向感与中高频细节",
+            "电影  ·  氛围增强\n对白存在感与低频冲击",
+        )
+        for index, text in enumerate(texts):
+            button = QPushButton(text)
+            button.setCheckable(True)
+            button.setMinimumHeight(62)
+            button.clicked.connect(
+                lambda _checked=False, selected=index: self._set_sound_mode(selected)
+            )
+            self.sound_group.addButton(button, index)
+            self.sound_buttons.append(button)
+            controls_layout.addWidget(button)
+
+        controls_layout.addWidget(self._divider())
+        guidance = QLabel(
+            "实用建议\n"
+            "· 人声发闷：优先音乐模式，音量控制在 16–24。\n"
+            "· 电影对白不清：电影模式，但夜间不要盲目提高音量。\n"
+            "· FPS 游戏：游戏模式，减少持续低频带来的听觉疲劳。\n"
+            "· 桌面近距离使用：不要把音量长期推到最大。"
+        )
+        guidance.setObjectName("muted")
+        guidance.setWordWrap(True)
+        controls_layout.addWidget(guidance)
+        controls_layout.addStretch()
+        self.sound_status = QLabel("等待选择模式")
+        self.sound_status.setObjectName("chipMuted")
+        controls_layout.addWidget(self.sound_status)
+        layout.addWidget(controls, 2)
+        return page
+
+    def _load_eq_capability(self):
+        try:
+            info = api_get("/api/eq/info", timeout=4.0)
+            eq_index = info.get("eq_index")
+            probe = info.get("custom_eq_probe") or {}
+            custom_supported = bool(probe.get("supported"))
+            text = f"硬件 EQ 类型 {eq_index} · 3 个预设"
+            text += " · 支持自定义 EQ" if custom_supported else " · 不支持自定义频段"
+            self._set_chip(
+                self.sound_capability,
+                text,
+                "good" if custom_supported else "muted",
+            )
+        except Exception as error:
+            self._set_chip(
+                self.sound_capability,
+                f"设备 EQ 状态读取失败：{error}",
+                "warn",
+            )
+
+    def _set_sound_mode(self, index):
+        modes = (
+            (
+                "音乐模式",
+                "相对均衡，人声和乐器兼顾，适合流行、女声、播客和长时间聆听。",
+            ),
+            (
+                "游戏模式",
+                "加强脚步、方向和环境中高频细节，同时控制持续低频，适合 FPS、MOBA 和竞速。",
+            ),
+            (
+                "电影模式",
+                "强调对白存在感和低频氛围，动态更积极；长时间音乐聆听可能不如音乐模式自然。",
+            ),
+        )
+        try:
+            api_post("/api/eq/preset", {"index": index}, timeout=5.0)
+            api_post(
+                "/api/settings",
+                {"sound_mode": index, "reapply_device": False},
+                timeout=4.0,
+            )
+            self.settings["sound_mode"] = index
+            if 0 <= index < len(self.sound_buttons):
+                self.sound_buttons[index].setChecked(True)
+            self.sound_curve.set_mode(index)
+            self.sound_mode_title.setText(modes[index][0])
+            self.sound_mode_detail.setText(modes[index][1])
+            self._set_chip(self.sound_status, "硬件模式已切换", "good")
+        except Exception as error:
+            self._set_chip(self.sound_status, f"切换失败：{error}", "warn")
+
     def _selected_scene(self):
+        if self.nav.currentRow() >= 4:
+            return self.settings.get("scene", "lyrics")
         return ("lyrics", "audio", "notifications", "performance")[
             max(0, min(3, self.nav.currentRow()))
         ]
@@ -1005,9 +1232,11 @@ class SettingsWindow(QMainWindow):
 
     def _switch_scene(self, row):
         self.pages.setCurrentIndex(row)
-        names = ("歌词", "音频频谱", "消息通知", "游戏性能")
+        names = ("歌词", "音频频谱", "消息通知", "游戏性能", "音效调优")
         self.nav_state.setText(f"当前显示：{names[row]}")
-        if not self._suppress_scene_change:
+        if row == 4:
+            self._load_eq_capability()
+        elif not self._suppress_scene_change:
             self._apply_scene_options()
 
     def _apply_scene_options(self):
@@ -1022,7 +1251,7 @@ class SettingsWindow(QMainWindow):
             )
             self.settings.update(result.get("settings", {}))
             self.nav_state.setText(
-                f"当前显示：{('歌词', '音频频谱', '消息通知', '游戏性能')[self.nav.currentRow()]}"
+                f"当前显示：{('歌词', '音频频谱', '消息通知', '游戏性能', '音效调优')[self.nav.currentRow()]}"
             )
         except Exception as error:
             self.nav_state.setText(f"场景切换失败：{error}")
@@ -1065,7 +1294,7 @@ class SettingsWindow(QMainWindow):
             self.fps_button.setEnabled(True)
 
     def _refresh_scene_preview(self):
-        if self.nav.currentRow() == 0:
+        if self.nav.currentRow() in (0, 4):
             return
         try:
             frame = api_get("/api/scene-frame", timeout=1.5)
@@ -1087,6 +1316,7 @@ class SettingsWindow(QMainWindow):
             "notify_wechat": self.notify_wechat.isChecked(),
             "notify_qq": self.notify_qq.isChecked(),
             "notify_qqmail": self.notify_qqmail.isChecked(),
+            "sound_mode": self.sound_group.checkedId(),
             "reapply_device": bool(reapply_device),
         }
 
@@ -1102,6 +1332,14 @@ class SettingsWindow(QMainWindow):
         except Exception:
             pass
         self._set_offset(int(self.settings.get("line_offset_ms", 0)))
+        sound_mode = max(
+            0,
+            min(2, int(self.settings.get("sound_mode", 0))),
+        )
+        if hasattr(self, "sound_buttons"):
+            self.sound_buttons[sound_mode].setChecked(True)
+            self.sound_curve.set_mode(sound_mode)
+            self._set_sound_mode_label(sound_mode)
         scene_index = {
             "lyrics": 0,
             "audio": 1,
@@ -1127,6 +1365,25 @@ class SettingsWindow(QMainWindow):
         self.notify_qqmail.setChecked(
             bool(self.settings.get("notify_qqmail", True))
         )
+
+    def _set_sound_mode_label(self, index):
+        details = (
+            (
+                "音乐模式",
+                "相对均衡，人声和乐器兼顾，适合流行、女声、播客和长时间聆听。",
+            ),
+            (
+                "游戏模式",
+                "加强脚步、方向和环境中高频细节，同时控制持续低频，适合 FPS、MOBA 和竞速。",
+            ),
+            (
+                "电影模式",
+                "强调对白存在感和低频氛围，动态更积极；长时间音乐聆听可能不如音乐模式自然。",
+            ),
+        )
+        title, detail = details[max(0, min(2, int(index)))]
+        self.sound_mode_title.setText(title)
+        self.sound_mode_detail.setText(detail)
 
     def _on_offset_changed(self, value):
         self.offset_value.setText(format_offset(value))
