@@ -38,7 +38,13 @@ def extract_embedded_pyz(exe: Path) -> bytes:
     raise ValueError("embedded PyInstaller PYZ archive not found")
 
 
-def write_pyz(path: Path, original: bytes, toc, replacement: bytes):
+def write_pyz(
+    path: Path,
+    original: bytes,
+    toc,
+    replacement: bytes,
+    extra_modules: dict[str, bytes] | None = None,
+):
     entries = []
     payloads = []
     seen_target = False
@@ -59,6 +65,11 @@ def write_pyz(path: Path, original: bytes, toc, replacement: bytes):
             entries.append((name, (typecode, data_offset, len(raw))))
             payloads.append(raw)
             data_offset += len(raw)
+
+    for name, payload in (extra_modules or {}).items():
+        entries.append((name, (0, data_offset, len(payload))))
+        payloads.append(payload)
+        data_offset += len(payload)
 
     if not seen_target:
         raise ValueError(f"PYZ module not found: {WRAPPER_MODULE}")
@@ -159,12 +170,31 @@ def main():
     parser.add_argument("--replacement", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--patched-pyz", required=True, type=Path)
+    parser.add_argument(
+        "--extra-module",
+        action="append",
+        default=[],
+        metavar="MODULE=PATH",
+        help="add or replace an additional PYZ module",
+    )
     args = parser.parse_args()
 
+    extra_modules = {}
+    for item in args.extra_module:
+        if "=" not in item:
+            parser.error("--extra-module must use MODULE=PATH")
+        name, path = item.split("=", 1)
+        extra_modules[name] = zlib.compress(Path(path).read_bytes()[16:], 6)
     pyz_bytes = args.pyz.read_bytes() if args.pyz else extract_embedded_pyz(args.exe)
     original_pyz, toc = read_pyz_bytes(pyz_bytes)
     replacement = zlib.compress(args.replacement.read_bytes()[16:], 6)
-    count = write_pyz(args.patched_pyz, original_pyz, toc, replacement)
+    count = write_pyz(
+        args.patched_pyz,
+        original_pyz,
+        toc,
+        replacement,
+        extra_modules,
+    )
     size = patch_archive(args.exe, args.patched_pyz, args.output)
     print(f"patched PYZ entries: {count}")
     print(f"patched executable: {args.output} ({size} bytes)")

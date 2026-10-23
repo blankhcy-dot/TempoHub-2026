@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import subprocess
@@ -30,14 +31,18 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
+    QComboBox,
     QFrame,
     QGraphicsDropShadowEffect,
     QHBoxLayout,
     QLabel,
+    QListWidget,
     QMainWindow,
     QProgressBar,
     QPushButton,
     QSlider,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -154,6 +159,16 @@ def format_seconds(value):
     return f"{value // 60:02d}:{value % 60:02d}"
 
 
+def format_metric(value):
+    if value is None:
+        return "--"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "--"
+    return f"{number:.1f}".rstrip("0").rstrip(".")
+
+
 def format_offset(milliseconds):
     value = int(milliseconds)
     if value == 0:
@@ -213,29 +228,120 @@ class LyricPreview(QLabel):
         self.setPixmap(pixmap)
 
 
+class MatrixPreview(QLabel):
+    def __init__(self):
+        super().__init__()
+        self.setFixedSize(PREVIEW_WIDTH * 2, PREVIEW_HEIGHT * 2)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setStyleSheet(
+            "background:#030405; border:1px solid #20262c; border-radius:12px;"
+        )
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(34)
+        shadow.setOffset(0, 12)
+        shadow.setColor(QColor(0, 0, 0, 140))
+        self.setGraphicsEffect(shadow)
+        self.show_message("LIVE PREVIEW")
+
+    def show_message(self, text):
+        image = QImage(
+            PREVIEW_WIDTH,
+            PREVIEW_HEIGHT,
+            QImage.Format.Format_Grayscale8,
+        )
+        image.fill(QColor("#020304"))
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, False)
+        font = QFont("Consolas")
+        font.setPixelSize(9)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(QColor("white"))
+        painter.drawText(
+            QRectF(0, 0, PREVIEW_WIDTH, PREVIEW_HEIGHT),
+            int(Qt.AlignmentFlag.AlignCenter.value),
+            text,
+        )
+        painter.end()
+        self._set_image(image)
+
+    def set_frame(self, encoded):
+        try:
+            packed = base64.b64decode(encoded or "")
+        except Exception:
+            return
+        expected = PREVIEW_WIDTH * PREVIEW_HEIGHT // 8
+        if len(packed) != expected:
+            return
+        image = QImage(
+            PREVIEW_WIDTH,
+            PREVIEW_HEIGHT,
+            QImage.Format.Format_Grayscale8,
+        )
+        image.fill(QColor("black"))
+        offset = 0
+        for y in range(PREVIEW_HEIGHT):
+            for x_byte in range(PREVIEW_WIDTH // 8):
+                value = packed[offset]
+                offset += 1
+                for bit in range(8):
+                    if value & (1 << (7 - bit)):
+                        image.setPixelColor(x_byte * 8 + bit, y, QColor("white"))
+        self._set_image(image)
+
+    def _set_image(self, image):
+        pixmap = QPixmap.fromImage(image).scaled(
+            PREVIEW_WIDTH * 2,
+            PREVIEW_HEIGHT * 2,
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.FastTransformation,
+        )
+        self.setPixmap(pixmap)
+
+
 class SettingsWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Halo PixelBar 歌词控制台")
-        self.setMinimumSize(940, 610)
-        self.resize(1040, 680)
+        self.setWindowTitle("Halo PixelBar 控制台")
+        self.setMinimumSize(1080, 660)
+        self.resize(1180, 760)
         self.settings = {
             "enabled": True,
             "engine": "native",
             "line_offset_ms": 0,
+            "scene": "lyrics",
+            "audio_mode": "bars",
+            "audio_sensitivity": 55,
+            "notify_wechat": True,
+            "notify_qq": True,
+            "notify_qqmail": True,
+            "perf_show_fps": True,
+            "perf_show_cpu": True,
+            "perf_show_gpu": True,
+            "perf_show_memory": True,
         }
         self._suppress_offset_change = False
+        self._suppress_scene_change = True
         self._build_ui()
         self.offset_apply_timer = QTimer(self)
         self.offset_apply_timer.setSingleShot(True)
         self.offset_apply_timer.setInterval(400)
         self.offset_apply_timer.timeout.connect(self._apply_offset)
+        self.scene_apply_timer = QTimer(self)
+        self.scene_apply_timer.setSingleShot(True)
+        self.scene_apply_timer.setInterval(250)
+        self.scene_apply_timer.timeout.connect(self._apply_scene_options)
         self._load_settings()
+        self._suppress_scene_change = False
         self._refresh_state()
         self.timer = QTimer(self)
         self.timer.setInterval(1000)
         self.timer.timeout.connect(self._refresh_state)
         self.timer.start()
+        self.preview_timer = QTimer(self)
+        self.preview_timer.setInterval(350)
+        self.preview_timer.timeout.connect(self._refresh_scene_preview)
+        self.preview_timer.start()
 
     def _card(self):
         card = QFrame()
@@ -387,6 +493,60 @@ class SettingsWindow(QMainWindow):
                 padding:5px 8px;
             }
             QPushButton#quiet:hover { color:#E8EDF0; }
+            QFrame#navCard {
+                background:#101418;
+                border:1px solid #242B32;
+                border-radius:20px;
+            }
+            QLabel#navTitle {
+                color:#FFFFFF;
+                font-size:16px;
+                font-weight:700;
+            }
+            QListWidget#sceneNav {
+                background:transparent;
+                border:0;
+                outline:0;
+            }
+            QListWidget#sceneNav::item {
+                color:#8C979F;
+                border-radius:12px;
+                padding:12px 12px;
+                margin:3px 0;
+            }
+            QListWidget#sceneNav::item:hover {
+                background:#171D22;
+                color:#F0F4F6;
+            }
+            QListWidget#sceneNav::item:selected {
+                background:#16271E;
+                color:#62E79E;
+                border:1px solid #28513A;
+            }
+            QComboBox {
+                background:#171C21;
+                color:#E9EEF1;
+                border:1px solid #303941;
+                border-radius:10px;
+                padding:7px 10px;
+            }
+            QComboBox::drop-down { border:0; width:24px; }
+            QCheckBox {
+                color:#C9D1D6;
+                spacing:9px;
+                padding:5px 0;
+            }
+            QCheckBox::indicator {
+                width:16px;
+                height:16px;
+                border-radius:5px;
+                border:1px solid #3A454E;
+                background:#171C21;
+            }
+            QCheckBox::indicator:checked {
+                background:#42DE8C;
+                border-color:#42DE8C;
+            }
             """
         )
 
@@ -402,7 +562,7 @@ class SettingsWindow(QMainWindow):
         brand_box.setSpacing(3)
         brand = QLabel("Halo PixelBar")
         brand.setObjectName("brand")
-        subtitle = QLabel("歌词控制台  ·  网易云精确同步")
+        subtitle = QLabel("Halo PixelBar 控制台  ·  歌词 / 频谱 / 通知 / 性能")
         subtitle.setObjectName("subtitle")
         brand_box.addWidget(brand)
         brand_box.addWidget(subtitle)
@@ -416,6 +576,39 @@ class SettingsWindow(QMainWindow):
         body = QHBoxLayout()
         body.setSpacing(16)
         outer.addLayout(body, 1)
+
+        nav_card = QFrame()
+        nav_card.setObjectName("navCard")
+        nav_card.setFixedWidth(190)
+        nav_layout = QVBoxLayout(nav_card)
+        nav_layout.setContentsMargins(16, 20, 16, 18)
+        nav_layout.setSpacing(12)
+        nav_title = QLabel("显示场景")
+        nav_title.setObjectName("navTitle")
+        nav_layout.addWidget(nav_title)
+        nav_hint = QLabel("选择要投送到 Halo PixelBar 的应用")
+        nav_hint.setObjectName("muted")
+        nav_hint.setWordWrap(True)
+        nav_layout.addWidget(nav_hint)
+        self.nav = QListWidget()
+        self.nav.setObjectName("sceneNav")
+        for text in ("歌词", "音频频谱", "消息通知", "游戏性能"):
+            self.nav.addItem(text)
+        self.nav.setCurrentRow(0)
+        nav_layout.addWidget(self.nav, 1)
+        self.nav_state = QLabel("设备画面随场景自动切换")
+        self.nav_state.setObjectName("muted")
+        self.nav_state.setWordWrap(True)
+        nav_layout.addWidget(self.nav_state)
+        body.addWidget(nav_card)
+
+        self.pages = QStackedWidget()
+        body.addWidget(self.pages, 1)
+        self.lyrics_page = QWidget()
+        lyrics_page_layout = QHBoxLayout(self.lyrics_page)
+        lyrics_page_layout.setContentsMargins(0, 0, 0, 0)
+        lyrics_page_layout.setSpacing(16)
+        self.pages.addWidget(self.lyrics_page)
 
         preview_card = self._card()
         preview_layout = QVBoxLayout(preview_card)
@@ -473,7 +666,7 @@ class SettingsWindow(QMainWindow):
         chip_row.addWidget(self.sync_chip)
         chip_row.addStretch()
         preview_layout.addLayout(chip_row)
-        body.addWidget(preview_card, 3)
+        lyrics_page_layout.addWidget(preview_card, 3)
 
         settings_card = self._card()
         settings_layout = QVBoxLayout(settings_card)
@@ -548,19 +741,352 @@ class SettingsWindow(QMainWindow):
         actions.addStretch()
         actions.addWidget(self.apply_btn)
         settings_layout.addLayout(actions)
-        body.addWidget(settings_card, 2)
+        lyrics_page_layout.addWidget(settings_card, 2)
+
+        self.audio_page, self.audio_preview = self._build_audio_page()
+        self.notification_page, self.notification_preview = (
+            self._build_notification_page()
+        )
+        self.performance_page, self.performance_preview = (
+            self._build_performance_page()
+        )
+        self.pages.addWidget(self.audio_page)
+        self.pages.addWidget(self.notification_page)
+        self.pages.addWidget(self.performance_page)
 
         self.offset.valueChanged.connect(self._on_offset_changed)
         self.offset.sliderReleased.connect(self._apply_offset)
         self.reset_offset_btn.clicked.connect(lambda: self.offset.setValue(0))
         self.apply_btn.clicked.connect(self._apply)
         self.restore_btn.clicked.connect(self._restore_native)
+        self.nav.currentRowChanged.connect(self._switch_scene)
+
+    def _build_audio_page(self):
+        page = QWidget()
+        layout = QHBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(16)
+
+        preview_card = self._card()
+        preview_layout = QVBoxLayout(preview_card)
+        preview_layout.setContentsMargins(26, 22, 26, 22)
+        preview_layout.setSpacing(12)
+        eyebrow = QLabel("SYSTEM AUDIO")
+        eyebrow.setObjectName("eyebrow")
+        preview_layout.addWidget(eyebrow)
+        title = QLabel("实时音频频谱")
+        title.setObjectName("songTitle")
+        preview_layout.addWidget(title)
+        hint = QLabel("采集 Windows 系统输出，网易云、QQ 音乐和浏览器声音均可使用。")
+        hint.setObjectName("muted")
+        hint.setWordWrap(True)
+        preview_layout.addWidget(hint)
+        preview = MatrixPreview()
+        preview_layout.addWidget(preview, 0, Qt.AlignmentFlag.AlignHCenter)
+        preview_layout.addWidget(self._divider())
+        self.audio_metrics = QLabel("等待系统音频")
+        self.audio_metrics.setObjectName("lyric")
+        preview_layout.addWidget(self.audio_metrics)
+        preview_layout.addStretch()
+        self.audio_status = QLabel("系统音频监听准备中")
+        self.audio_status.setObjectName("chipMuted")
+        preview_layout.addWidget(
+            self.audio_status, 0, Qt.AlignmentFlag.AlignLeft
+        )
+        layout.addWidget(preview_card, 3)
+
+        controls = self._card()
+        controls_layout = QVBoxLayout(controls)
+        controls_layout.setContentsMargins(24, 22, 24, 20)
+        controls_layout.setSpacing(12)
+        control_eyebrow = QLabel("VISUALIZER")
+        control_eyebrow.setObjectName("eyebrow")
+        controls_layout.addWidget(control_eyebrow)
+        control_title = QLabel("显示样式")
+        control_title.setObjectName("section")
+        controls_layout.addWidget(control_title)
+
+        mode_label = QLabel("频谱模式")
+        mode_label.setObjectName("muted")
+        controls_layout.addWidget(mode_label)
+        self.audio_mode = QComboBox()
+        self.audio_mode.addItem("柱状频谱", "bars")
+        self.audio_mode.addItem("波形", "wave")
+        self.audio_mode.addItem("双 VU 表", "vu")
+        controls_layout.addWidget(self.audio_mode)
+
+        sensitivity_title = QLabel("灵敏度")
+        sensitivity_title.setObjectName("section")
+        controls_layout.addWidget(sensitivity_title)
+        self.audio_sensitivity_value = QLabel("55")
+        self.audio_sensitivity_value.setObjectName("offsetValue")
+        controls_layout.addWidget(
+            self.audio_sensitivity_value, 0, Qt.AlignmentFlag.AlignLeft
+        )
+        self.audio_sensitivity = QSlider(Qt.Orientation.Horizontal)
+        self.audio_sensitivity.setObjectName("offsetSlider")
+        self.audio_sensitivity.setRange(20, 100)
+        self.audio_sensitivity.setSingleStep(5)
+        controls_layout.addWidget(self.audio_sensitivity)
+        sensitivity_hint = QLabel(
+            "灵敏度越高，低音量时柱形变化越明显。系统音频通过 WASAPI loopback 采集。"
+        )
+        sensitivity_hint.setObjectName("muted")
+        sensitivity_hint.setWordWrap(True)
+        controls_layout.addWidget(sensitivity_hint)
+        controls_layout.addStretch()
+        audio_apply = QPushButton("应用频谱设置")
+        audio_apply.setObjectName("primary")
+        audio_apply.clicked.connect(self._apply_scene_options)
+        controls_layout.addWidget(audio_apply)
+        layout.addWidget(controls, 2)
+
+        self.audio_mode.currentIndexChanged.connect(self._schedule_scene_apply)
+        self.audio_sensitivity.valueChanged.connect(self._on_audio_sensitivity)
+        return page, preview
+
+    def _build_notification_page(self):
+        page = QWidget()
+        layout = QHBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(16)
+
+        preview_card = self._card()
+        preview_layout = QVBoxLayout(preview_card)
+        preview_layout.setContentsMargins(26, 22, 26, 22)
+        preview_layout.setSpacing(12)
+        eyebrow = QLabel("MESSAGE ALERTS")
+        eyebrow.setObjectName("eyebrow")
+        preview_layout.addWidget(eyebrow)
+        title = QLabel("微信、QQ 与邮箱通知")
+        title.setObjectName("songTitle")
+        preview_layout.addWidget(title)
+        hint = QLabel("检测到未读消息时，在屏幕顶部显示发送应用和消息摘要。")
+        hint.setObjectName("muted")
+        hint.setWordWrap(True)
+        preview_layout.addWidget(hint)
+        preview = MatrixPreview()
+        preview_layout.addWidget(preview, 0, Qt.AlignmentFlag.AlignHCenter)
+        preview_layout.addWidget(self._divider())
+        self.notification_latest = QLabel("暂无新通知")
+        self.notification_latest.setObjectName("lyric")
+        self.notification_latest.setWordWrap(True)
+        preview_layout.addWidget(self.notification_latest)
+        preview_layout.addStretch()
+        self.notification_status = QLabel("正在连接 Windows 通知")
+        self.notification_status.setObjectName("chipMuted")
+        preview_layout.addWidget(
+            self.notification_status, 0, Qt.AlignmentFlag.AlignLeft
+        )
+        layout.addWidget(preview_card, 3)
+
+        controls = self._card()
+        controls_layout = QVBoxLayout(controls)
+        controls_layout.setContentsMargins(24, 22, 24, 20)
+        controls_layout.setSpacing(12)
+        control_eyebrow = QLabel("MONITOR")
+        control_eyebrow.setObjectName("eyebrow")
+        controls_layout.addWidget(control_eyebrow)
+        control_title = QLabel("监听范围")
+        control_title.setObjectName("section")
+        controls_layout.addWidget(control_title)
+        self.notify_wechat = QCheckBox("微信")
+        self.notify_qq = QCheckBox("QQ")
+        self.notify_qqmail = QCheckBox("QQ 邮箱")
+        controls_layout.addWidget(self.notify_wechat)
+        controls_layout.addWidget(self.notify_qq)
+        controls_layout.addWidget(self.notify_qqmail)
+        notification_hint = QLabel(
+            "优先读取 Windows 通知中心；权限不可用时回退到未读窗口标题检测。"
+        )
+        notification_hint.setObjectName("muted")
+        notification_hint.setWordWrap(True)
+        controls_layout.addWidget(notification_hint)
+        controls_layout.addStretch()
+        wechat_test = QPushButton("测试微信通知")
+        qq_test = QPushButton("测试 QQ 通知")
+        mail_test = QPushButton("测试 QQ 邮箱")
+        wechat_test.clicked.connect(
+            lambda: self._test_notification("微信", "你有一条新的微信消息")
+        )
+        qq_test.clicked.connect(
+            lambda: self._test_notification("QQ", "你收到了一条新的 QQ 消息")
+        )
+        mail_test.clicked.connect(
+            lambda: self._test_notification("QQ邮箱", "你收到了一封新邮件")
+        )
+        controls_layout.addWidget(wechat_test)
+        controls_layout.addWidget(qq_test)
+        controls_layout.addWidget(mail_test)
+        layout.addWidget(controls, 2)
+
+        for checkbox in (self.notify_wechat, self.notify_qq, self.notify_qqmail):
+            checkbox.checkStateChanged.connect(self._schedule_scene_apply)
+        return page, preview
+
+    def _build_performance_page(self):
+        page = QWidget()
+        layout = QHBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(16)
+
+        preview_card = self._card()
+        preview_layout = QVBoxLayout(preview_card)
+        preview_layout.setContentsMargins(26, 22, 26, 22)
+        preview_layout.setSpacing(12)
+        eyebrow = QLabel("GAME TELEMETRY")
+        eyebrow.setObjectName("eyebrow")
+        preview_layout.addWidget(eyebrow)
+        title = QLabel("游戏性能曲线")
+        title.setObjectName("songTitle")
+        preview_layout.addWidget(title)
+        hint = QLabel("四路曲线依次显示 FPS、CPU、GPU 和内存；GPU 同时显示温度。")
+        hint.setObjectName("muted")
+        hint.setWordWrap(True)
+        preview_layout.addWidget(hint)
+        preview = MatrixPreview()
+        preview_layout.addWidget(preview, 0, Qt.AlignmentFlag.AlignHCenter)
+        preview_layout.addWidget(self._divider())
+        self.performance_values = QLabel("等待性能数据")
+        self.performance_values.setObjectName("lyric")
+        self.performance_values.setWordWrap(True)
+        preview_layout.addWidget(self.performance_values)
+        preview_layout.addStretch()
+        self.performance_status = QLabel("CPU / GPU / 内存采样运行中")
+        self.performance_status.setObjectName("chipMuted")
+        preview_layout.addWidget(
+            self.performance_status, 0, Qt.AlignmentFlag.AlignLeft
+        )
+        layout.addWidget(preview_card, 3)
+
+        controls = self._card()
+        controls_layout = QVBoxLayout(controls)
+        controls_layout.setContentsMargins(24, 22, 24, 20)
+        controls_layout.setSpacing(12)
+        control_eyebrow = QLabel("FRAME RATE")
+        control_eyebrow.setObjectName("eyebrow")
+        controls_layout.addWidget(control_eyebrow)
+        control_title = QLabel("FPS 采集")
+        control_title.setObjectName("section")
+        controls_layout.addWidget(control_title)
+        fps_hint = QLabel(
+            "FPS 由 Intel PresentMon 采集，首次启用会弹出一次 Windows 管理员授权。"
+        )
+        fps_hint.setObjectName("muted")
+        fps_hint.setWordWrap(True)
+        controls_layout.addWidget(fps_hint)
+        self.fps_button = QPushButton("启用 FPS 采集")
+        self.fps_button.setObjectName("primary")
+        self.fps_button.clicked.connect(self._start_fps_capture)
+        controls_layout.addWidget(self.fps_button)
+        self.fps_status = QLabel("FPS 尚未启用")
+        self.fps_status.setObjectName("chipMuted")
+        controls_layout.addWidget(self.fps_status)
+        controls_layout.addWidget(self._divider())
+        detail = QLabel(
+            "CPU 和内存约每秒采样；NVIDIA GPU 使用 nvidia-smi。"
+            "CPU 温度在当前驱动不允许普通权限访问时会显示为 --。"
+        )
+        detail.setObjectName("muted")
+        detail.setWordWrap(True)
+        controls_layout.addWidget(detail)
+        controls_layout.addStretch()
+        layout.addWidget(controls, 2)
+        return page, preview
+
+    def _selected_scene(self):
+        return ("lyrics", "audio", "notifications", "performance")[
+            max(0, min(3, self.nav.currentRow()))
+        ]
+
+    def _schedule_scene_apply(self):
+        if not self._suppress_scene_change:
+            self.scene_apply_timer.start()
+
+    def _switch_scene(self, row):
+        self.pages.setCurrentIndex(row)
+        names = ("歌词", "音频频谱", "消息通知", "游戏性能")
+        self.nav_state.setText(f"当前显示：{names[row]}")
+        if not self._suppress_scene_change:
+            self._apply_scene_options()
+
+    def _apply_scene_options(self):
+        self.scene_apply_timer.stop()
+        try:
+            result = api_post(
+                "/api/settings",
+                self._settings_payload(
+                    reapply_device=self._selected_scene() == "lyrics"
+                ),
+                timeout=12.0,
+            )
+            self.settings.update(result.get("settings", {}))
+            self.nav_state.setText(
+                f"当前显示：{('歌词', '音频频谱', '消息通知', '游戏性能')[self.nav.currentRow()]}"
+            )
+        except Exception as error:
+            self.nav_state.setText(f"场景切换失败：{error}")
+
+    def _on_audio_sensitivity(self, value):
+        self.audio_sensitivity_value.setText(str(int(value)))
+        self._schedule_scene_apply()
+
+    def _test_notification(self, app_name, text):
+        try:
+            api_post(
+                "/api/notifications/test",
+                {"app": app_name, "text": text},
+                timeout=3.0,
+            )
+            self.notification_latest.setText(f"{app_name} · {text}")
+            self._set_chip(self.notification_status, "测试通知已发送", "good")
+        except Exception as error:
+            self._set_chip(self.notification_status, f"测试失败：{error}", "warn")
+
+    def _start_fps_capture(self):
+        self.fps_button.setEnabled(False)
+        self._set_chip(self.fps_status, "等待管理员授权…", "muted")
+        try:
+            result = api_post(
+                "/api/performance/start-fps",
+                {},
+                timeout=60.0,
+            )
+            status = result.get("status") or "启动中"
+            error = result.get("error")
+            self._set_chip(
+                self.fps_status,
+                error or status,
+                "warn" if error else "good",
+            )
+        except Exception as error:
+            self._set_chip(self.fps_status, f"启动失败：{error}", "warn")
+        finally:
+            self.fps_button.setEnabled(True)
+
+    def _refresh_scene_preview(self):
+        if self.nav.currentRow() == 0:
+            return
+        try:
+            frame = api_get("/api/scene-frame", timeout=1.5)
+            self.pages.currentWidget().findChild(MatrixPreview).set_frame(
+                frame.get("matrix", "")
+            )
+        except Exception:
+            pass
 
     def _settings_payload(self, reapply_device=False):
+        scene = self._selected_scene()
         return {
             "enabled": True,
-            "engine": "native",
+            "scene": scene,
+            "engine": "native" if scene == "lyrics" else "custom",
             "line_offset_ms": self.offset.value(),
+            "audio_mode": self.audio_mode.currentData(),
+            "audio_sensitivity": self.audio_sensitivity.value(),
+            "notify_wechat": self.notify_wechat.isChecked(),
+            "notify_qq": self.notify_qq.isChecked(),
+            "notify_qqmail": self.notify_qqmail.isChecked(),
             "reapply_device": bool(reapply_device),
         }
 
@@ -576,6 +1102,31 @@ class SettingsWindow(QMainWindow):
         except Exception:
             pass
         self._set_offset(int(self.settings.get("line_offset_ms", 0)))
+        scene_index = {
+            "lyrics": 0,
+            "audio": 1,
+            "notifications": 2,
+            "performance": 3,
+        }.get(self.settings.get("scene", "lyrics"), 0)
+        self.nav.setCurrentRow(scene_index)
+        self.pages.setCurrentIndex(scene_index)
+        audio_index = self.audio_mode.findData(
+            self.settings.get("audio_mode", "bars")
+        )
+        self.audio_mode.setCurrentIndex(max(0, audio_index))
+        self.audio_sensitivity.setValue(
+            int(self.settings.get("audio_sensitivity", 55))
+        )
+        self.audio_sensitivity_value.setText(
+            str(self.audio_sensitivity.value())
+        )
+        self.notify_wechat.setChecked(
+            bool(self.settings.get("notify_wechat", True))
+        )
+        self.notify_qq.setChecked(bool(self.settings.get("notify_qq", True)))
+        self.notify_qqmail.setChecked(
+            bool(self.settings.get("notify_qqmail", True))
+        )
 
     def _on_offset_changed(self, value):
         self.offset_value.setText(format_offset(value))
@@ -608,7 +1159,11 @@ class SettingsWindow(QMainWindow):
             )
             self.settings.update(result.get("settings", {}))
             self.status.setText("已连接 TempoHub")
-            self.device_state.setText("歌词模式已重新应用")
+            self.device_state.setText(
+                "歌词模式已重新应用"
+                if self._selected_scene() == "lyrics"
+                else "显示场景已应用"
+            )
             self.device_state.setObjectName("chipGood")
             self.device_state.style().unpolish(self.device_state)
             self.device_state.style().polish(self.device_state)
@@ -622,6 +1177,9 @@ class SettingsWindow(QMainWindow):
     def _restore_native(self):
         try:
             api_post("/api/restore-native", {})
+            self._suppress_scene_change = True
+            self.nav.setCurrentRow(0)
+            self._suppress_scene_change = False
             self.device_state.setText("已重新开启设备歌词")
             self.device_state.setObjectName("chipGood")
             self.device_state.style().unpolish(self.device_state)
@@ -708,12 +1266,71 @@ class SettingsWindow(QMainWindow):
             self._set_chip(self.device_chip, "设备歌词未开启", "muted")
             self._set_chip(self.device_state, "可点击“重新开启歌词”", "muted")
 
+        widgets = state.get("widgets") or {}
+        audio = widgets.get("audio") or {}
+        if audio.get("error"):
+            self._set_chip(self.audio_status, audio["error"], "warn")
+            self.audio_metrics.setText("系统音频不可用")
+        elif audio.get("levels"):
+            self._set_chip(self.audio_status, "系统音频监听中", "good")
+            self.audio_metrics.setText(
+                f"Peak {float(audio.get('peak_db', -80)):.1f} dB  ·  "
+                f"RMS {float(audio.get('rms_db', -80)):.1f} dB"
+            )
+
+        notifications = widgets.get("notifications") or {}
+        notification_status = notifications.get("status")
+        notification_error = notifications.get("error")
+        latest = notifications.get("latest") or {}
+        if latest:
+            self.notification_latest.setText(
+                f"{latest.get('app', '通知')} · {latest.get('text', '')}"
+            )
+        elif notification_status:
+            self.notification_latest.setText("暂无新通知")
+        if notification_error:
+            self._set_chip(
+                self.notification_status,
+                f"回退到窗口检测：{notification_error}",
+                "warn",
+            )
+        elif notification_status:
+            self._set_chip(
+                self.notification_status,
+                notification_status,
+                "good"
+                if ("监听" in notification_status or "检测" in notification_status)
+                else "muted",
+            )
+
+        performance = widgets.get("performance") or {}
+        fps = performance.get("fps")
+        cpu = performance.get("cpu")
+        gpu = performance.get("gpu")
+        gpu_temp = performance.get("gpu_temp")
+        memory = performance.get("memory")
+        self.performance_values.setText(
+            f"FPS {format_metric(fps)}  ·  CPU {format_metric(cpu)}%  ·  "
+            f"GPU {format_metric(gpu)}% / {format_metric(gpu_temp)}°C  ·  "
+            f"内存 {format_metric(memory)}%"
+        )
+        fps_status = performance.get("fps_status")
+        fps_error = performance.get("fps_error")
+        if fps_error:
+            self._set_chip(self.fps_status, fps_error, "warn")
+        elif fps_status:
+            self._set_chip(
+                self.fps_status,
+                fps_status,
+                "good" if fps_status == "采集中" else "muted",
+            )
+
 
 def main():
     ensure_tempo_hub_running()
     ensure_netease_running()
     app = QApplication(sys.argv)
-    app.setApplicationName("Halo PixelBar 歌词控制台")
+    app.setApplicationName("Halo PixelBar 控制台")
     window = SettingsWindow()
     window.show()
     sys.exit(app.exec())

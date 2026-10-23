@@ -39,5 +39,5 @@ $settingsShortcut.TargetPath = $pythonw
 $settingsShortcut.Arguments = '"' + $settings + '"'
 $settingsShortcut.WorkingDirectory = $appDirPath
 $settingsShortcut.IconLocation = "$exe,0"
-$settingsShortcut.Description = "Halo PixelBar 歌词控制台"
+$settingsShortcut.Description = "Halo PixelBar 控制台"
 $settingsShortcut.Save()

@@ -1,6 +1,6 @@
 # TempoHub NetEase Lyrics
 
-让 EDIFIER TempoHub / Halo PixelBar 在播放网易云音乐时显示同步歌词。
+让 EDIFIER TempoHub / Halo PixelBar 显示网易云歌词、系统音频频谱、消息通知和游戏性能曲线。
 
 这是一个面向已经购买设备并安装了官方 TempoHub 的用户的非官方增强工具。
 仓库不包含 EDIFIER 的原程序或资源文件；安装器只在用户本机读取官方安装，
@@ -17,6 +17,10 @@
 - 原生歌词模式下自动保持设备歌词屏开启。
 - 支持 `-5 秒 ~ +5 秒` 歌词偏移，横向滑杆调整后自动应用。
 - 网易云歌词不可用时回退到 TempoHub 原有的 QQ 音乐歌词逻辑。
+- 左侧场景导航可在歌词、音频频谱、消息通知和游戏性能之间切换。
+- 音频频谱使用 Windows WASAPI 系统输出回环，支持柱状频谱、波形和双 VU 表。
+- 消息通知支持微信、QQ 和 QQ 邮箱；优先使用 Windows 通知中心，并回退到未读窗口标题检测。
+- 游戏性能页显示 FPS、CPU、GPU、GPU 温度、内存及四条历史曲线。
 
 ## 安装
 
@@ -59,6 +63,8 @@ python installer.py --app-dir "C:\Program Files (x86)\EDIFIER TempoHub"
   再从歌词快捷方式启动一次。
 - 日志位于 `%TEMP%\tempo_hub_netease_lyrics.log`。
 - 设置保存在 `%APPDATA%\TempoHubLyrics\settings.json`。
+- FPS 由随安装包提供的 Intel PresentMon 采集，首次启用需要一次 Windows 管理员授权。
+- CPU 温度取决于主板驱动权限；无法读取时会显示 `--`，其他性能指标不受影响。
 
 ## 卸载
 

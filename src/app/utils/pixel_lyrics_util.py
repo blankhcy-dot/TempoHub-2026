@@ -5,11 +5,13 @@ import time. The original implementation remains available under
 ``app.utils.pixel_lyrics_util_orig`` and is used as a fallback.
 """
 
+import base64
 import json
 import os
 import queue
 import re
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -24,6 +26,7 @@ from app.utils import pixel_lyrics_util_orig as _orig
 from app.utils.pixel_lyrics_util_orig import *  # noqa: F401,F403
 from app.utils.pixel_lyrics_util_orig import PixelLyricsMonitor, parse_lrc_to_timeline
 from PyQt6.QtCore import QObject, QTimer, Qt, pyqtSignal, pyqtSlot
+from app.utils.tempo_scene_engine import SceneEngine
 
 
 _SEARCH_URL = "https://music.163.com/api/search/get/web"
@@ -66,7 +69,9 @@ _NETEASE_PROGRESS_LOCK = threading.Lock()
 _NETEASE_PROGRESS_THREAD = None
 _NETEASE_CDP_URL = "http://127.0.0.1:9222"
 _CANVAS_LAST_START = 0.0
+_SCENE_LAST_SEND = 0.0
 _PROTOCOL_LOGGING_INSTALLED = False
+_SCENE_ENGINE = None
 _NETEASE_API_LOCK = threading.Lock()
 _NETEASE_API_BLOCK_UNTIL = 0.0
 _NETEASE_START_LOCK = threading.Lock()
@@ -75,6 +80,16 @@ _NETEASE_MODULE_STARTED_AT = time.monotonic()
 
 _DEFAULT_SETTINGS = {
     "enabled": True,
+    "scene": "lyrics",
+    "audio_mode": "bars",
+    "audio_sensitivity": 55,
+    "notify_wechat": True,
+    "notify_qq": True,
+    "notify_qqmail": True,
+    "perf_show_fps": True,
+    "perf_show_cpu": True,
+    "perf_show_gpu": True,
+    "perf_show_memory": True,
     "font_family": "Microsoft YaHei UI",
     "font_size": 22,
     "font_weight": 600,
@@ -120,7 +135,16 @@ def _save_settings(settings):
     with open(temporary, "w", encoding="utf-8") as file:
         json.dump(merged, file, ensure_ascii=False, indent=2)
     os.replace(temporary, _SETTINGS_PATH)
+    if _SCENE_ENGINE is not None:
+        try:
+            _SCENE_ENGINE.configure(merged)
+        except Exception as error:
+            _log("scene_configure_error", error=str(error))
     return merged
+
+
+_SCENE_ENGINE = SceneEngine(os.path.dirname(sys.executable), _log)
+_SCENE_ENGINE.configure(_load_settings())
 
 
 def _render_text_matrix(text, font_family, font_size, font_weight=600):
@@ -732,7 +756,11 @@ class _CanvasBridge(QObject):
     @pyqtSlot(object)
     def handle(self, job):
         global _CANVAS_MODEL, _CANVAS_WALLPAPER_ID, _QQ_MODEL
-        _log("canvas_handle_received", text=job.get("text", ""))
+        _log(
+            "canvas_handle_received",
+            text=job.get("text", ""),
+            scene=job.get("scene"),
+        )
         try:
             from app.utils.hz_canvas_bin_utils import HzCanvasBinUtils
 
@@ -744,12 +772,14 @@ class _CanvasBridge(QObject):
                 else:
                     raise RuntimeError("画布正在传输上一帧，请稍后再试")
 
-            matrix = _render_text_matrix(
-                job.get("text", ""),
-                job.get("font_family", _DEFAULT_SETTINGS["font_family"]),
-                job.get("font_size", _DEFAULT_SETTINGS["font_size"]),
-                job.get("font_weight", _DEFAULT_SETTINGS["font_weight"]),
-            )
+            matrix = job.get("matrix")
+            if matrix is None:
+                matrix = _render_text_matrix(
+                    job.get("text", ""),
+                    job.get("font_family", _DEFAULT_SETTINGS["font_family"]),
+                    job.get("font_size", _DEFAULT_SETTINGS["font_size"]),
+                    job.get("font_weight", _DEFAULT_SETTINGS["font_weight"]),
+                )
             spec = _CANVAS_MODEL.canvas_matrix_spec
             if _CANVAS_WALLPAPER_ID is None:
                 file_bytes = HzCanvasBinUtils.matrix_to_bin(matrix, spec)
@@ -765,6 +795,7 @@ class _CanvasBridge(QObject):
             _log(
                 "canvas_queued",
                 text=job.get("text", ""),
+                scene=job.get("scene"),
                 show=bool(job.get("show", False)),
                 mode_group_index=getattr(_CANVAS_MODEL, "mode_group_index", None),
                 wallpaper_count=len(
@@ -828,9 +859,13 @@ def _ensure_canvas_model_safe():
 
 def _ensure_native_lyrics_safe():
     try:
-        if _load_settings().get("engine") == "native":
+        settings = _load_settings()
+        if (
+            settings.get("scene", "lyrics") == "lyrics"
+            and settings.get("engine") == "native"
+        ):
             _force_native_lyrics(
-                _load_settings().get("lyrics_display_mode", 1)
+                settings.get("lyrics_display_mode", 1)
             )
     except Exception as error:
         _log("native_lyrics_startup_error", error=str(error))
@@ -842,6 +877,7 @@ def _dispatch_canvas(job):
 
 
 def _poll_canvas_jobs():
+    global _SCENE_LAST_SEND
     latest = None
     while True:
         try:
@@ -850,6 +886,25 @@ def _poll_canvas_jobs():
             break
     if latest is not None and _CANVAS_BRIDGE is not None:
         _CANVAS_BRIDGE.handle(latest)
+        return
+    if _SCENE_ENGINE is None or _CANVAS_BRIDGE is None:
+        return
+    settings = _load_settings()
+    scene = str(settings.get("scene", "lyrics"))
+    if scene == "lyrics" or time.time() - _SCENE_LAST_SEND < 0.16:
+        return
+    try:
+        model = _ensure_canvas_model()
+        if getattr(model, "_is_ed03_running", False):
+            return
+        matrix = _SCENE_ENGINE.render_matrix(scene)
+        if matrix:
+            _SCENE_LAST_SEND = time.time()
+            _CANVAS_BRIDGE.handle(
+                {"matrix": matrix, "scene": scene, "show": False}
+            )
+    except Exception as error:
+        _log("scene_render_error", scene=scene, error=str(error))
 
 
 class _LocalApiHandler(BaseHTTPRequestHandler):
@@ -882,6 +937,7 @@ class _LocalApiHandler(BaseHTTPRequestHandler):
                 200,
                 {
                     "running": bool(monitor and getattr(monitor, "_running", False)),
+                    "scene": _load_settings().get("scene", "lyrics"),
                     "song": getattr(monitor, "_last_title", None) if monitor else None,
                     "artist": getattr(monitor, "_last_artist", None) if monitor else None,
                     "listen_mode": getattr(monitor, "_listen_mode", None) if monitor else None,
@@ -906,6 +962,38 @@ class _LocalApiHandler(BaseHTTPRequestHandler):
                     "canvas_packet_index": getattr(
                         _CANVAS_MODEL, "_canvas_packet_index", None
                     ),
+                    "widgets": (
+                        _SCENE_ENGINE.snapshot()
+                        if _SCENE_ENGINE is not None
+                        else {}
+                    ),
+                },
+            )
+            return
+        if self.path == "/api/scene-frame":
+            settings = _load_settings()
+            scene = str(settings.get("scene", "lyrics"))
+            matrix = (
+                _SCENE_ENGINE.render_matrix(scene)
+                if _SCENE_ENGINE is not None
+                else None
+            )
+            packed = bytearray()
+            if matrix:
+                for row in matrix:
+                    for start in range(0, len(row), 8):
+                        value = 0
+                        for bit in range(8):
+                            if start + bit < len(row) and row[start + bit]:
+                                value |= 1 << (7 - bit)
+                        packed.append(value)
+            self._send(
+                200,
+                {
+                    "scene": scene,
+                    "width": 256,
+                    "height": 32,
+                    "matrix": base64.b64encode(packed).decode("ascii"),
                 },
             )
             return
@@ -937,6 +1025,7 @@ class _LocalApiHandler(BaseHTTPRequestHandler):
 
         if self.path == "/api/settings":
             try:
+                previous_scene = _load_settings().get("scene", "lyrics")
                 reapply_device = bool(payload.get("reapply_device", True))
                 stored_payload = {
                     key: value
@@ -944,6 +1033,7 @@ class _LocalApiHandler(BaseHTTPRequestHandler):
                     if key != "reapply_device"
                 }
                 settings = _save_settings(stored_payload)
+                scene = str(settings.get("scene", "lyrics"))
                 monitor = _ACTIVE_MONITOR
                 base_timeline = getattr(
                     monitor, "_netease_base_timeline", None
@@ -964,11 +1054,16 @@ class _LocalApiHandler(BaseHTTPRequestHandler):
                     monitor._last_lyric_line = None
                     monitor._locate_and_send_lyric()
                 result = {"settings": settings}
-                if settings.get("engine") == "native" and reapply_device:
+                if scene == "lyrics" and reapply_device:
                     result["device"] = _force_native_lyrics(
                         settings.get("lyrics_display_mode", 1)
                     )
                     _save_settings({"engine": "native"})
+                elif scene != "lyrics":
+                    settings = _save_settings({"engine": "custom"})
+                    result["settings"] = settings
+                    if previous_scene != scene:
+                        _log("scene_changed", scene=scene)
                 self._send(200, result)
             except Exception as error:
                 self._send(500, {"error": str(error)})
@@ -982,7 +1077,7 @@ class _LocalApiHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/api/restore-native":
             try:
-                settings = _save_settings({"engine": "native"})
+                settings = _save_settings({"engine": "native", "scene": "lyrics"})
                 self._send(
                     200,
                     {
@@ -1017,6 +1112,22 @@ class _LocalApiHandler(BaseHTTPRequestHandler):
                     ),
                 },
             )
+            return
+        if self.path == "/api/notifications/test":
+            try:
+                _SCENE_ENGINE.trigger_notification(
+                    str(payload.get("app") or "微信"),
+                    str(payload.get("text") or "这是一条测试消息"),
+                )
+                self._send(202, {"status": "queued"})
+            except Exception as error:
+                self._send(500, {"error": str(error)})
+            return
+        if self.path == "/api/performance/start-fps":
+            try:
+                self._send(202, _SCENE_ENGINE.start_fps_capture())
+            except Exception as error:
+                self._send(500, {"error": str(error)})
             return
         self._send(404, {"error": "not found"})
 
@@ -1267,6 +1378,8 @@ def _session_position_seconds(self):
 
 def _locate_and_send_lyric(self, provided_position=None):
     timeline = getattr(self, "_current_timeline", None)
+    if _load_settings().get("scene", "lyrics") != "lyrics":
+        return None
     if not timeline:
         return None
     if getattr(self, "_netease_source_active", False):
@@ -1361,6 +1474,8 @@ def _patch_qq_lyric_callback(owner):
 
     def patched(self, lyric_line):
         settings = _load_settings()
+        if settings.get("scene", "lyrics") != "lyrics":
+            return
         if (
             settings.get("enabled", True)
             and settings.get("engine") == "custom"

@@ -24,6 +24,7 @@ if (-not (Test-Path -LiteralPath $runtime)) {
     --name "TempoHub-NetEase-Installer" `
     --add-data "$root\tools;tools" `
     --add-data "$root\payload;payload" `
+    --add-data "$root\vendor;vendor" `
     --add-data "$root\ui;ui" `
     --add-data "$root\scripts;scripts" `
     --add-data "$runtime;runtime39" `

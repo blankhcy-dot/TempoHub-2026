@@ -159,9 +159,24 @@ def patch_executable(original_exe: Path, target_exe: Path, replacement_pyc: Path
     pyz_bytes = patch_temphub.extract_embedded_pyz(original_exe)
     original_pyz, toc = patch_temphub.read_pyz_bytes(pyz_bytes)
     replacement = zlib.compress(replacement_pyc.read_bytes()[16:], 6)
+    extra_modules = {}
+    for module_path in replacement_pyc.parent.glob("*.cpython-39.pyc"):
+        if module_path == replacement_pyc:
+            continue
+        module_name = f"app.utils.{module_path.name.split('.cpython-39.pyc')[0]}"
+        extra_modules[module_name] = zlib.compress(
+            module_path.read_bytes()[16:],
+            6,
+        )
     with tempfile.TemporaryDirectory(prefix="tempo-patch-") as temp_dir:
         temp_pyz = Path(temp_dir) / "PYZ-patched.pyz"
-        patch_temphub.write_pyz(temp_pyz, original_pyz, toc, replacement)
+        patch_temphub.write_pyz(
+            temp_pyz,
+            original_pyz,
+            toc,
+            replacement,
+            extra_modules,
+        )
         patch_temphub.patch_archive(original_exe, temp_pyz, target_exe)
 
 
@@ -234,6 +249,16 @@ def main() -> int:
         resource_path("scripts") / "uninstall.ps1",
         output / "uninstall.ps1",
     )
+    vendor_source = resource_path("vendor")
+    if vendor_source.is_dir():
+        shutil.copytree(vendor_source, output / "vendor", dirs_exist_ok=True)
+    output_tools = output / "tools"
+    output_tools.mkdir(exist_ok=True)
+    for name in ("PresentMon-2.6.0-x64.exe", "PresentMon.exe"):
+        candidate = resource_path("tools") / name
+        if candidate.is_file():
+            shutil.copy2(candidate, output_tools / name)
+            break
     (output / ".tempo-nexe-install").write_text(
         str(original_exe),
         encoding="utf-8",
