@@ -70,6 +70,11 @@ _NETEASE_PROGRESS_THREAD = None
 _NETEASE_CDP_URL = "http://127.0.0.1:9222"
 _CANVAS_LAST_START = 0.0
 _SCENE_LAST_SEND = 0.0
+_SCENE_SHOW_PENDING = True
+_SCENE_RENDER_NOT_BEFORE = 0.0
+_SCENE_HOME_GENERATION = 0
+_SCENE_PREPARE_REQUIRED = True
+_PIXEL_PROBE_MODEL = None
 _PROTOCOL_LOGGING_INSTALLED = False
 _SCENE_ENGINE = None
 _EQ_PROBE_MODEL = None
@@ -684,6 +689,32 @@ def _set_eq_preset(index):
     return {"preset": index}
 
 
+def _stop_time_tool_direct():
+    from driver.edifier_driver import ECDriver
+
+    mode_group_index = 1
+    if _CANVAS_MODEL is not None:
+        mode_group_index = getattr(_CANVAS_MODEL, "mode_group_index", None) or 1
+    payload = [
+        int(mode_group_index),
+        4,
+        0,
+        0,
+        0,
+        0,
+        3,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ]
+    _get_lyric_model().driver(ECDriver).hz_pixel_screen_set(payload)
+    _log("scene_time_tool_stopped_directly", payload=payload)
+    return {"payload": payload}
+
+
 def _get_lyric_model():
     from app.frame.home.view.device.module_sound_box_hz.view.hz_sound_box_pixel_music_lyric_model import (
         HzSoundBoxPixelMusicLyricModel,
@@ -707,6 +738,50 @@ def _get_lyric_model():
         _log("lyric_model_created")
     elif getattr(model, "mdevice", None) is None:
         model.set_device(_get_qq_model().mdevice)
+    return model
+
+
+def _get_pixel_model():
+    from PyQt6.QtWidgets import QApplication
+    from app.frame.home.view.device.module_sound_box_hz.sound_box_pixel_model_hz import (
+        SoundBoxPixelModelHz,
+    )
+
+    for widget in QApplication.allWidgets():
+        for attribute in ("model", "_model"):
+            candidate = getattr(widget, attribute, None)
+            if isinstance(candidate, SoundBoxPixelModelHz):
+                return candidate
+    return None
+
+
+def _ensure_pixel_probe_model():
+    global _PIXEL_PROBE_MODEL
+    if _PIXEL_PROBE_MODEL is not None:
+        return _PIXEL_PROBE_MODEL
+    from app.frame.home.view.device.module_sound_box_hz.sound_box_pixel_model_hz import (
+        SoundBoxPixelModelHz,
+    )
+
+    class PixelProbeModel(SoundBoxPixelModelHz):
+        def receive_data_from_usb(self, report):
+            result = super().receive_data_from_usb(report)
+            if getattr(report, "index", None) == 257:
+                _log(
+                    "pixel_query_response",
+                    time_tool_type=getattr(self, "time_tool_type", None),
+                    time_tool_state=getattr(
+                        self, "time_tool_running_state", None
+                    ),
+                    mode_group_index=getattr(self, "mode_group_index", None),
+                    screen_switch=getattr(self, "screen_switch", None),
+                )
+            return result
+
+    model = PixelProbeModel()
+    model.set_device(_get_qq_model().mdevice)
+    _PIXEL_PROBE_MODEL = model
+    model.init_data()
     return model
 
 
@@ -847,8 +922,8 @@ class _CanvasBridge(QObject):
             spec = _CANVAS_MODEL.canvas_matrix_spec
             if _CANVAS_WALLPAPER_ID is None:
                 file_bytes = HzCanvasBinUtils.matrix_to_bin(matrix, spec)
-                _CANVAS_WALLPAPER_ID = HzCanvasBinUtils.get_wallpaper_id_from_bin(
-                    file_bytes
+                _CANVAS_WALLPAPER_ID = (
+                    HzCanvasBinUtils.get_wallpaper_id_from_bin(file_bytes)
                 )
             _CANVAS_MODEL.pixel_canvas_send(
                 matrix,
@@ -866,8 +941,10 @@ class _CanvasBridge(QObject):
                     getattr(_CANVAS_MODEL, "wallpaper_combo_data", []) or []
                 ),
             )
+            return True
         except Exception as error:
             _log("canvas_error", error=str(error))
+            return False
 
 
 _CANVAS_BRIDGE = None
@@ -899,13 +976,7 @@ def _ensure_canvas_model():
                 )
             except Exception:
                 pass
-            result = super().receive_data_from_usb(report)
-            if was_running and getattr(report, "index", None) == 257:
-                # CM_ED01 is an unrelated settings query response.  The
-                # original implementation clears the transfer flag here,
-                # which can cancel an active canvas handshake.
-                self._is_ed03_running = True
-            return result
+            return super().receive_data_from_usb(report)
 
     _CANVAS_MODEL = _LoggedCanvasModel()
     _CANVAS_MODEL.set_device(qq_model.mdevice)
@@ -940,8 +1011,111 @@ def _dispatch_canvas(job):
     _log("canvas_dispatch_queued", text=job.get("text", ""))
 
 
+def _prepare_scene_display():
+    global _SCENE_LAST_SEND, _SCENE_SHOW_PENDING, _SCENE_RENDER_NOT_BEFORE
+    global _SCENE_HOME_GENERATION
+    _SCENE_LAST_SEND = 0.0
+    _SCENE_SHOW_PENDING = True
+    _SCENE_RENDER_NOT_BEFORE = time.time() + 0.8
+    try:
+        pixel_model = _get_pixel_model()
+        if pixel_model is None:
+            _log("scene_pixel_model_missing")
+            pixel_model = _ensure_pixel_probe_model()
+            QTimer.singleShot(1400, _finish_pixel_probe)
+            _stop_time_tool_direct()
+        else:
+            running = pixel_model.is_time_tool_running()
+            _log("scene_pixel_model_found", time_tool_running=running)
+            if running:
+                pixel_model.send_end_time_tool()
+                _log("scene_stopped_time_tool")
+    except Exception as error:
+        _log("scene_time_tool_stop_error", error=str(error))
+    try:
+        from driver.edifier_driver import ECDriver
+
+        _get_lyric_model().driver(ECDriver).hz_pixel_screen_set([1, 0, 0])
+        _log("scene_pixel_screen_enabled")
+    except Exception as error:
+        _log("scene_pixel_screen_enable_error", error=str(error))
+    if _CANVAS_MODEL is not None:
+        try:
+            _CANVAS_MODEL._is_ed03_running = False
+            reset = getattr(_CANVAS_MODEL, "_reset_canvas_send_state", None)
+            if reset is not None:
+                reset()
+        except Exception as error:
+            _log("canvas_scene_reset_error", error=str(error))
+    _SCENE_HOME_GENERATION += 1
+    generation = _SCENE_HOME_GENERATION
+
+    for delay in (3.0, 8.0, 15.0, 22.0):
+        QTimer.singleShot(
+            int(delay * 1000),
+            lambda attempt=delay: _commit_scene_home(generation, attempt),
+        )
+
+
+def _finish_pixel_probe():
+    model = _PIXEL_PROBE_MODEL
+    if model is None:
+        return
+    try:
+        try:
+            running = bool(model.is_time_tool_running())
+        except Exception:
+            running = False
+        _log(
+            "pixel_probe_finished",
+            time_tool_running=running,
+            time_tool_type=getattr(model, "time_tool_type", None),
+            time_tool_tone=getattr(model, "time_tool_tone_switch", None),
+            time_tool_mode=getattr(model, "time_tool_time_mode", None),
+            mode_group_index=getattr(model, "mode_group_index", None),
+        )
+        if running:
+            model.send_end_time_tool()
+            _log("scene_stopped_time_tool", mode="probe")
+    except Exception as error:
+        _log("pixel_probe_error", error=str(error))
+
+
+def _commit_scene_home(generation, attempt):
+    if generation != _SCENE_HOME_GENERATION:
+        return
+    try:
+        from driver.edifier_driver import ECDriver
+
+        mode_group = 1
+        if _CANVAS_MODEL is not None:
+            mode_group = getattr(_CANVAS_MODEL, "mode_group_index", None) or 1
+        _get_lyric_model().driver(ECDriver).hz_pixel_wallpaper_set(
+            [int(mode_group), 2, 0]
+        )
+        _log(
+            "scene_home_commit_sent",
+            attempt=attempt,
+            mode_group_index=mode_group,
+        )
+    except Exception as error:
+        _log("scene_home_commit_error", error=str(error))
+
+
+def _cancel_scene_home_commit():
+    global _SCENE_HOME_GENERATION, _SCENE_SHOW_PENDING, _SCENE_PREPARE_REQUIRED
+    _SCENE_HOME_GENERATION += 1
+    _SCENE_SHOW_PENDING = False
+    _SCENE_PREPARE_REQUIRED = False
+
+
+def _request_scene_display():
+    global _SCENE_PREPARE_REQUIRED
+    _SCENE_PREPARE_REQUIRED = True
+
+
 def _poll_canvas_jobs():
-    global _SCENE_LAST_SEND
+    global _SCENE_LAST_SEND, _SCENE_SHOW_PENDING, _SCENE_PREPARE_REQUIRED
     latest = None
     while True:
         try:
@@ -955,18 +1129,36 @@ def _poll_canvas_jobs():
         return
     settings = _load_settings()
     scene = str(settings.get("scene", "lyrics"))
-    if scene == "lyrics" or time.time() - _SCENE_LAST_SEND < 0.16:
+    if scene != "lyrics" and _SCENE_PREPARE_REQUIRED:
+        _SCENE_PREPARE_REQUIRED = False
+        _prepare_scene_display()
+        return
+    if (
+        scene == "lyrics"
+        or time.time() < _SCENE_RENDER_NOT_BEFORE
+        or time.time() - _SCENE_LAST_SEND < 0.16
+    ):
         return
     try:
+        model_was_none = _CANVAS_MODEL is None
         model = _ensure_canvas_model()
+        if model_was_none:
+            _prepare_scene_display()
+            return
         if getattr(model, "_is_ed03_running", False):
             return
         matrix = _SCENE_ENGINE.render_matrix(scene)
         if matrix:
             _SCENE_LAST_SEND = time.time()
-            _CANVAS_BRIDGE.handle(
-                {"matrix": matrix, "scene": scene, "show": False}
+            queued = _CANVAS_BRIDGE.handle(
+                {
+                    "matrix": matrix,
+                    "scene": scene,
+                    "show": _SCENE_SHOW_PENDING,
+                }
             )
+            if queued:
+                _SCENE_SHOW_PENDING = False
     except Exception as error:
         _log("scene_render_error", scene=scene, error=str(error))
 
@@ -1067,6 +1259,31 @@ class _LocalApiHandler(BaseHTTPRequestHandler):
             except Exception as error:
                 self._send(500, {"error": str(error)})
             return
+        if self.path == "/api/pixel-model":
+            try:
+                model = _get_pixel_model()
+                self._send(
+                    200,
+                    {
+                        "found": model is not None,
+                        "class": type(model).__name__ if model else None,
+                        "time_tool_running": (
+                            bool(model.is_time_tool_running()) if model else None
+                        ),
+                        "mode_group_index": getattr(
+                            model, "mode_group_index", None
+                        ),
+                    },
+                )
+            except Exception as error:
+                self._send(500, {"error": str(error)})
+            return
+        if self.path == "/api/pixel/end-time-tool":
+            try:
+                self._send(202, _stop_time_tool_direct())
+            except Exception as error:
+                self._send(500, {"error": str(error)})
+            return
         if self.path == "/api/eq/info":
             try:
                 self._send(200, _eq_info())
@@ -1131,6 +1348,7 @@ class _LocalApiHandler(BaseHTTPRequestHandler):
                     monitor._locate_and_send_lyric()
                 result = {"settings": settings}
                 if scene == "lyrics" and reapply_device:
+                    _cancel_scene_home_commit()
                     result["device"] = _force_native_lyrics(
                         settings.get("lyrics_display_mode", 1)
                     )
@@ -1140,6 +1358,7 @@ class _LocalApiHandler(BaseHTTPRequestHandler):
                     result["settings"] = settings
                     if previous_scene != scene:
                         _log("scene_changed", scene=scene)
+                    _request_scene_display()
                 self._send(200, result)
             except Exception as error:
                 self._send(500, {"error": str(error)})

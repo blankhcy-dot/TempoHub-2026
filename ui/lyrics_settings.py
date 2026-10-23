@@ -816,7 +816,7 @@ class SettingsWindow(QMainWindow):
         actions = QHBoxLayout()
         actions.setSpacing(10)
         self.restore_btn = QPushButton("重新开启歌词")
-        self.apply_btn = QPushButton("应用设置")
+        self.apply_btn = QPushButton("应用显示")
         self.apply_btn.setObjectName("primary")
         actions.addWidget(self.restore_btn)
         actions.addStretch()
@@ -918,7 +918,7 @@ class SettingsWindow(QMainWindow):
         sensitivity_hint.setWordWrap(True)
         controls_layout.addWidget(sensitivity_hint)
         controls_layout.addStretch()
-        audio_apply = QPushButton("应用频谱设置")
+        audio_apply = QPushButton("应用显示")
         audio_apply.setObjectName("primary")
         audio_apply.clicked.connect(self._apply_scene_options)
         controls_layout.addWidget(audio_apply)
@@ -986,6 +986,10 @@ class SettingsWindow(QMainWindow):
         notification_hint.setWordWrap(True)
         controls_layout.addWidget(notification_hint)
         controls_layout.addStretch()
+        notification_apply = QPushButton("应用显示")
+        notification_apply.setObjectName("primary")
+        notification_apply.clicked.connect(self._apply_scene_options)
+        controls_layout.addWidget(notification_apply)
         wechat_test = QPushButton("测试微信通知")
         qq_test = QPushButton("测试 QQ 通知")
         mail_test = QPushButton("测试 QQ 邮箱")
@@ -1059,7 +1063,6 @@ class SettingsWindow(QMainWindow):
         fps_hint.setWordWrap(True)
         controls_layout.addWidget(fps_hint)
         self.fps_button = QPushButton("启用 FPS 采集")
-        self.fps_button.setObjectName("primary")
         self.fps_button.clicked.connect(self._start_fps_capture)
         controls_layout.addWidget(self.fps_button)
         self.fps_status = QLabel("FPS 尚未启用")
@@ -1074,6 +1077,10 @@ class SettingsWindow(QMainWindow):
         detail.setWordWrap(True)
         controls_layout.addWidget(detail)
         controls_layout.addStretch()
+        performance_apply = QPushButton("应用显示")
+        performance_apply.setObjectName("primary")
+        performance_apply.clicked.connect(self._apply_scene_options)
+        controls_layout.addWidget(performance_apply)
         layout.addWidget(controls, 2)
         return page, preview
 
@@ -1164,6 +1171,10 @@ class SettingsWindow(QMainWindow):
         self.sound_status = QLabel("等待选择模式")
         self.sound_status.setObjectName("chipMuted")
         controls_layout.addWidget(self.sound_status)
+        sound_display = QPushButton("返回歌词显示")
+        sound_display.setObjectName("primary")
+        sound_display.clicked.connect(lambda: self._activate_scene_page(0))
+        controls_layout.addWidget(sound_display)
         layout.addWidget(controls, 2)
         return page
 
@@ -1260,7 +1271,15 @@ class SettingsWindow(QMainWindow):
         self.audio_sensitivity_value.setText(str(int(value)))
         self._schedule_scene_apply()
 
+    def _activate_scene_page(self, row):
+        self._suppress_scene_change = True
+        self.nav.setCurrentRow(row)
+        self.pages.setCurrentIndex(row)
+        self._suppress_scene_change = False
+        self._apply_scene_options()
+
     def _test_notification(self, app_name, text):
+        self._activate_scene_page(2)
         try:
             api_post(
                 "/api/notifications/test",
@@ -1273,6 +1292,7 @@ class SettingsWindow(QMainWindow):
             self._set_chip(self.notification_status, f"测试失败：{error}", "warn")
 
     def _start_fps_capture(self):
+        self._activate_scene_page(3)
         self.fps_button.setEnabled(False)
         self._set_chip(self.fps_status, "等待管理员授权…", "muted")
         try:
