@@ -23,6 +23,8 @@ from PyQt6.QtGui import QColor, QFont, QFontMetricsF, QImage, QPainter, QPen, QP
 SCREEN_WIDTH = 256
 SCREEN_HEIGHT = 32
 AUDIO_BARS = 32
+AUDIO_MODES = ("bars", "wave", "vu", "mirror", "waterfall", "pulse", "particles", "orbit", "mountains")
+PERFORMANCE_MODES = ("tiles", "gauges", "trends", "hud", "focus", "minimal")
 HISTORY_LENGTH = 60
 
 
@@ -47,6 +49,13 @@ class SceneEngine:
         self.app_dir = Path(app_dir)
         self.log = log
         self._lock = threading.RLock()
+        self._configure_lock = threading.RLock()
+        self._fps_start_lock = threading.Lock()
+        self._render_lock = threading.Lock()
+        self._render_cache = None
+        self._fft_plan = None
+        self._audio_visual = None
+        self._gpu_retry_at = 0.0
         self._settings = {}
         self._stop_event = threading.Event()
         self._audio_stream = None
@@ -100,18 +109,26 @@ class SceneEngine:
         self._notification_thread.start()
 
     def configure(self, settings):
-        previous_scene = self._settings.get("scene", "lyrics")
-        with self._lock:
-            self._settings = dict(settings)
-            scene = self._settings.get("scene", "lyrics")
-        if scene == "audio":
-            self._ensure_audio_stream()
-        elif previous_scene == "audio":
-            self._stop_audio_stream()
-        if scene != "performance":
-            self._fps_status = (
-                "后台采集" if self._fps_thread and self._fps_thread.is_alive() else self._fps_status
-            )
+        # Device enumeration and stream start/stop must not overlap between
+        # concurrent settings requests.
+        with self._configure_lock:
+            with self._lock:
+                previous_scene = self._settings.get("scene", "lyrics")
+                self._settings = dict(settings)
+                scene = self._settings.get("scene", "lyrics")
+                if (self._alert and not self._alert.get("test")
+                        and not self._notification_allowed(self._alert.get("app", ""))):
+                    self._alert = None
+            with self._render_lock:
+                self._render_cache = None
+            if scene == "audio":
+                self._ensure_audio_stream()
+            elif previous_scene == "audio":
+                self._stop_audio_stream()
+            if scene != "performance":
+                self._fps_status = (
+                    "后台采集" if self._fps_thread and self._fps_thread.is_alive() else self._fps_status
+                )
 
     def snapshot(self):
         with self._lock:
@@ -145,9 +162,14 @@ class SceneEngine:
             }
 
     def trigger_notification(self, app_name, text):
-        self._set_alert(app_name, text)
+        # A local test is an explicit action, independent of passive monitoring.
+        self._set_alert(app_name, text, force=True)
 
     def start_fps_capture(self):
+        with self._fps_start_lock:
+            return self._start_fps_capture()
+
+    def _start_fps_capture(self):
         if self._fps_thread is not None and self._fps_thread.is_alive():
             return {"status": self._fps_status, "already_running": True}
         executable = next(
@@ -170,7 +192,8 @@ class SceneEngine:
         except OSError:
             pass
         self._fps_offset = 0
-        self._fps_rows.clear()
+        with self._lock:
+            self._fps_rows.clear()
         arguments = (
             f'--output_file "{self._fps_csv_path}" --v1_metrics '
             "--no_console_stats --stop_existing_session "
@@ -200,6 +223,18 @@ class SceneEngine:
         return {"status": self._fps_status}
 
     def render_matrix(self, scene=None):
+        # The device and settings preview can request the same frame at once.
+        with self._render_lock:
+            scene = scene or self._settings.get("scene", "lyrics")
+            now = time.monotonic()
+            cached = self._render_cache
+            if cached is not None and cached[0] == scene and now - cached[1] < 0.08:
+                return cached[2]
+            matrix = self._render_matrix(scene)
+            self._render_cache = (scene, now, matrix)
+            return matrix
+
+    def _render_matrix(self, scene):
         with self._lock:
             settings = dict(self._settings)
             signal = self.snapshot()
@@ -227,13 +262,14 @@ class SceneEngine:
 
     @staticmethod
     def _image_to_matrix(image):
-        return [
-            [
-                1 if image.pixelColor(x, y).lightness() >= 96 else 0
-                for x in range(SCREEN_WIDTH)
-            ]
-            for y in range(SCREEN_HEIGHT)
-        ]
+        if image.format() != QImage.Format.Format_Grayscale8:
+            image = image.convertToFormat(QImage.Format.Format_Grayscale8)
+        pixels = image.constBits().asstring(image.sizeInBytes())
+        stride = image.bytesPerLine()
+        threshold = bytes(0 if value < 96 else 1 for value in range(256))
+        binary = pixels.translate(threshold)
+        return [list(binary[y * stride:y * stride + SCREEN_WIDTH])
+                for y in range(SCREEN_HEIGHT)]
 
     def _font(self, size, family="Consolas", bold=False):
         font = QFont(family)
@@ -258,11 +294,16 @@ class SceneEngine:
         ]
         wave = audio.get("wave") or [0.0] * 128
         error = audio.get("error")
+        visual = self._audio_animation(mode, levels)
+        smooth = visual["levels"]
+        peaks = visual["peaks"]
+        energy = math.sqrt(sum(smooth) / max(1, len(smooth)))
+        phase = visual["phase"]
         if mode == "wave":
             points = [
                 QPointF(
                     index * (SCREEN_WIDTH - 1) / max(1, len(wave) - 1),
-                    SCREEN_HEIGHT / 2 - float(value) * (SCREEN_HEIGHT - 5) / 2,
+                    SCREEN_HEIGHT / 2 - _clamp(float(value) * sensitivity, -1.0, 1.0) * (SCREEN_HEIGHT - 5) / 2,
                 )
                 for index, value in enumerate(wave)
             ]
@@ -270,10 +311,12 @@ class SceneEngine:
             painter.drawPolyline(QPolygonF(points))
         elif mode == "vu":
             self._draw_text(painter, 4, 8, "SYSTEM AUDIO", 7, bold=True)
-            self._draw_text(painter, 4, 18, "L", 8, bold=True)
-            self._draw_text(painter, 4, 29, "R", 8, bold=True)
-            peak = _clamp((float(audio.get("peak_db") or -80.0) + 60.0) / 60.0, 0.0, 1.0)
-            rms = _clamp((float(audio.get("rms_db") or -80.0) + 60.0) / 60.0, 0.0, 1.0)
+            self._draw_text(painter, 1, 18, "PK", 7, bold=True)
+            self._draw_text(painter, 1, 29, "RM", 7, bold=True)
+            peak_db = audio.get("peak_db")
+            rms_db = audio.get("rms_db")
+            peak = _clamp((float(peak_db if peak_db is not None else -80.0) + 60.0) / 60.0, 0.0, 1.0)
+            rms = _clamp((float(rms_db if rms_db is not None else -80.0) + 60.0) / 60.0, 0.0, 1.0)
             painter.drawRect(QRectF(15, 12, 205, 5))
             painter.fillRect(QRectF(15, 12, 205 * peak, 5), QColor("white"))
             painter.drawRect(QRectF(15, 22, 205, 5))
@@ -282,12 +325,93 @@ class SceneEngine:
                 painter,
                 225,
                 17,
-                f"{audio.get('peak_db', -80):.0f}dB",
+                f"{peak_db if peak_db is not None else -80:.0f}dB",
                 7,
             )
+        elif mode == "mirror":
+            for index in range(16):
+                level = sum(smooth[index * 2:index * 2 + 2]) / 2
+                peak = max(peaks[index * 2:index * 2 + 2])
+                half = max(1, round(level * 14))
+                cap = max(half, round(peak * 14))
+                for x in (129 - (index + 1) * 8, 130 + index * 8):
+                    painter.fillRect(QRectF(x, 16 - half, 5, half * 2), QColor("white"))
+                    painter.drawLine(QPointF(x, 16 - cap), QPointF(x + 4, 16 - cap))
+                    painter.drawLine(QPointF(x, 15 + cap), QPointF(x + 4, 15 + cap))
+        elif mode == "waterfall":
+            for y, row in enumerate(visual["history"]):
+                for index, value in enumerate(row):
+                    x = index * 8
+                    value *= 1.0 - y / (SCREEN_HEIGHT - 1) * 0.65
+                    if value > 0.65:
+                        painter.fillRect(QRectF(x + 1, y, 6, 1), QColor("white"))
+                    elif value > 0.35:
+                        painter.drawLine(QPointF(x + 2, y), QPointF(x + 5, y))
+                    elif value > 0.12:
+                        painter.drawPoint(QPointF(x + 2 + (y % 2) * 2, y))
+        elif mode == "pulse":
+            for layer in (1.0, -1.0, 0.48):
+                points = []
+                for index in range(128):
+                    x = index * 255 / 127
+                    envelope = 0.25 + 0.75 * math.sin(math.pi * index / 127)
+                    carrier = (math.sin(x / 19 - phase * 5) * 0.65
+                               + math.sin(x / 7 + phase * 3) * 0.35)
+                    y = 15.5 + carrier * envelope * energy * 15.5 * layer
+                    points.append(QPointF(x, y))
+                painter.drawPolyline(QPolygonF(points))
+        elif mode == "particles":
+            for index in range(80):
+                band = (index * 11) % AUDIO_BARS
+                strength = smooth[band]
+                if strength < 0.08 or strength < ((index * 37) % 83) / 110:
+                    continue
+                x = ((index * 53.3 + phase * (12 + band * 0.9)) % 256)
+                y = 15.5 + math.sin(index * 2.39 + phase * 0.7) * (6 + strength * 9)
+                tail = round(strength * 5) if index % 4 == 0 else 0
+                painter.drawLine(QPointF(max(0, x - tail), y), QPointF(x, y))
+                if strength > 0.75 and index % 7 == 0:
+                    painter.drawPoint(QPointF(x, _clamp(y + 1, 0, 31)))
+        elif mode == "orbit":
+            for ring in (0, 1):
+                rx = 38 + energy * 64 - ring * 20
+                ry = 3 + energy * 10 - ring * 1.5
+                points = []
+                for index in range(65):
+                    angle = index * math.tau / 64
+                    ripple = math.sin(angle * 5 + phase * 2) * energy * 2
+                    points.append(QPointF(128 + math.cos(angle) * (rx + ripple),
+                                          15.5 + math.sin(angle) * (ry + ripple * 0.25)))
+                painter.drawPolyline(QPolygonF(points))
+                for index in range(3):
+                    angle = phase * (0.8 + ring * 0.3) + index * math.tau / 3
+                    x, y = 128 + math.cos(angle) * rx, 15.5 + math.sin(angle) * ry
+                    painter.fillRect(QRectF(x - 1, y - 1, 3, 3), QColor("white"))
+            core = 1 + round(energy * 3)
+            painter.fillRect(QRectF(128 - core, 15.5 - core, core * 2, core * 2), QColor("white"))
+            painter.drawLine(QPointF(4, 15.5), QPointF(24, 15.5))
+            painter.drawLine(QPointF(232, 15.5), QPointF(252, 15.5))
+            for x in (28, 224):
+                height = max(1, round(energy * 8))
+                painter.drawLine(QPointF(x, 16 - height), QPointF(x, 15 + height))
+        elif mode == "mountains":
+            for layer in (2, 1, 0):
+                pen = QPen(QColor("white"), 1)
+                if layer:
+                    pen.setStyle(Qt.PenStyle.DotLine)
+                painter.setPen(pen)
+                points = []
+                shift = int(phase * 2) + layer * 4
+                for index in range(AUDIO_BARS):
+                    value = smooth[(index + shift) % AUDIO_BARS]
+                    y = 30 - layer * 4 - value * (26 - layer * 5)
+                    y += math.sin(index * 0.45 + phase * 2 + layer) * energy * 1.7
+                    points.append(QPointF(index * 255 / (AUDIO_BARS - 1), _clamp(y, 0, 31)))
+                painter.drawPolyline(QPolygonF(points))
+            painter.setPen(QPen(QColor("white"), 1))
         else:
             for index in range(AUDIO_BARS):
-                level = _clamp(float(levels[index] if index < len(levels) else 0.0), 0.0, 1.0)
+                level = smooth[index]
                 height = max(1, int(round(level * (SCREEN_HEIGHT - 3))))
                 painter.fillRect(
                     QRectF(index * 8, SCREEN_HEIGHT - height, 6, height),
@@ -296,6 +420,35 @@ class SceneEngine:
         if error:
             painter.fillRect(QRectF(0, 0, SCREEN_WIDTH, 9), QColor("black"))
             self._draw_text(painter, 3, 8, "AUDIO OFF", 7, bold=True)
+
+    def _audio_animation(self, mode, levels):
+        """One bounded, time-based state shared by device and preview rendering."""
+        now = time.monotonic()
+        levels = list(levels[:AUDIO_BARS])
+        levels.extend([0.0] * (AUDIO_BARS - len(levels)))
+        visual = getattr(self, "_audio_visual", None)
+        if visual is None or visual["mode"] != mode:
+            visual = {"mode": mode, "updated": now, "history_at": now,
+                      "levels": levels, "peaks": list(levels), "phase": 0.0,
+                      "history": deque([list(levels)], maxlen=SCREEN_HEIGHT)}
+            self._audio_visual = visual
+            return visual
+        elapsed = _clamp(now - visual["updated"], 0.0, 1.0)
+        visual["updated"] = now
+        smooth = []
+        for previous, target in zip(visual["levels"], levels):
+            rate = 28.0 if target > previous else 6.0
+            smooth.append(previous + (target - previous) * (1.0 - math.exp(-elapsed * rate)))
+        visual["levels"] = smooth
+        visual["peaks"] = [max(level, peak - elapsed * 0.55)
+                           for level, peak in zip(smooth, visual["peaks"])]
+        energy = sum(smooth) / AUDIO_BARS
+        if energy > 0.01:
+            visual["phase"] += elapsed * (0.6 + energy * 2.5)
+        if now - visual["history_at"] >= 0.08:
+            visual["history"].appendleft(list(smooth))
+            visual["history_at"] = now
+        return visual
 
     def _draw_notifications(self, painter, settings, state):
         latest = state.get("latest") or {}
@@ -326,58 +479,125 @@ class SceneEngine:
         painter.drawLine(3, 28, SCREEN_WIDTH - 4, 28)
 
     def _draw_performance(self, painter, settings, state):
-        values = {
-            "fps": state.get("fps"),
-            "cpu": state.get("cpu"),
-            "gpu": state.get("gpu"),
-            "memory": state.get("memory"),
-        }
+        mode = settings.get("performance_mode", "tiles")
+        entries = [(key, label) for key, label in (("fps", "FPS"), ("cpu", "CPU"),
+                    ("gpu", "GPU"), ("memory", "MEM")) if settings.get("perf_show_" + key, True)]
+        if not entries:
+            self._draw_text(painter, 68, 20, "NO METRICS SELECTED", 10, bold=True)
+            return
         histories = state.get("history") or {}
-        labels = ("FPS", "CPU", "GPU", "MEM")
-        keys = ("fps", "cpu", "gpu", "memory")
-        for index, (label, key) in enumerate(zip(labels, keys)):
-            x = index * 64
-            if index:
-                painter.drawLine(x, 1, x, SCREEN_HEIGHT - 1)
-            value = values[key]
-            suffix = "%" if key in ("cpu", "gpu", "memory") else ""
-            text = label + " " + _safe_number(value, 0) + suffix
-            if key == "cpu" and state.get("cpu_temp") is not None:
-                text += f" {_safe_number(state.get('cpu_temp'), 0)}C"
-            if key == "gpu" and state.get("gpu_temp") is not None:
-                text += f" {_safe_number(state.get('gpu_temp'), 0)}C"
-            self._draw_text(painter, x + 3, 8, text[:13], 7, bold=True)
-            points = histories.get(key) or []
-            graph = QRectF(x + 2, 11, 60, 19)
-            painter.drawRect(graph)
-            if not points:
-                continue
-            numeric = [float(point) for point in points if point is not None]
-            if not numeric:
-                continue
-            max_value = 100.0
-            if key == "fps":
-                max_value = max(60.0, max(numeric) * 1.1)
-            scaled = [
-                QPointF(
-                    graph.left() + index_point * graph.width() / max(1, len(points) - 1),
-                    graph.bottom()
-                    - _clamp(float(point or 0.0) / max_value, 0.0, 1.0)
-                    * (graph.height() - 2),
-                )
-                for index_point, point in enumerate(points)
-            ]
-            painter.setPen(QPen(QColor("white"), 1))
-            painter.drawPolyline(QPolygonF(scaled))
 
-    def _set_alert(self, app_name, text):
+        def number(key):
+            return _safe_number(state.get(key))
+
+        def ratio(key):
+            value = state.get(key)
+            if value is None:
+                return 0.0
+            return _clamp(float(value) / (240.0 if key == "fps" else 100.0), 0.0, 1.0)
+
+        def graph(key, rect):
+            points = histories.get(key) or []
+            numeric = [float(p) for p in points if p is not None]
+            maximum = max(60.0, max(numeric, default=0.0) * 1.1) if key == "fps" else 100.0
+            # Gaps in unavailable telemetry must remain gaps, not false zeros.
+            segment = []
+            for index, value in enumerate(points):
+                if value is None:
+                    if len(segment) > 1:
+                        painter.drawPolyline(QPolygonF(segment))
+                    segment = []
+                    continue
+                segment.append(QPointF(rect.left() + index * rect.width() / max(1, len(points) - 1),
+                                       rect.bottom() - _clamp(float(value) / maximum, 0.0, 1.0) * rect.height()))
+            if len(segment) > 1:
+                painter.drawPolyline(QPolygonF(segment))
+
+        painter.setPen(QPen(QColor("white"), 1))
+        if mode == "focus":
+            key, label = entries[0]
+            self._draw_text(painter, 3, 9, label, 8, bold=True)
+            self._draw_text(painter, 3, 31, number(key) + ("%" if key != "fps" else ""), 24, bold=True)
+            if len(entries) > 1:
+                painter.drawLine(110, 1, 110, 30)
+                for index, (key, label) in enumerate(entries[1:]):
+                    y = index * 10
+                    self._draw_text(painter, 116, y + 8, label, 8, bold=True)
+                    self._draw_text(painter, 151, y + 8, number(key) + "%", 8)
+                    painter.drawRect(188, y + 2, 64, 5)
+                    painter.fillRect(190, y + 4, int(60 * ratio(key)), 2, QColor("white"))
+            else:
+                graph(key, QRectF(116, 4, 136, 23))
+            return
+        if mode == "trends":
+            row_height = 32.0 / len(entries)
+            for index, (key, label) in enumerate(entries):
+                top = int(index * row_height)
+                self._draw_text(painter, 1, top + 7, label, 7, bold=True)
+                self._draw_text(painter, 222, top + 7, number(key), 7)
+                graph(key, QRectF(29, top + 1, 187, max(3, row_height - 3)))
+                if index:
+                    for x in range(30, 216, 4):
+                        painter.drawPoint(x, top)
+            return
+        for index, (key, label) in enumerate(entries):
+            left = index * SCREEN_WIDTH // len(entries)
+            right = (index + 1) * SCREEN_WIDTH // len(entries)
+            width = right - left
+            text = number(key) + ("%" if key != "fps" else "")
+            if mode == "gauges":
+                center = left + width // 2
+                painter.drawArc(QRectF(center - 17, 1, 34, 34), 30 * 16, 120 * 16)
+                painter.drawArc(QRectF(center - 14, 4, 28, 28), 30 * 16, int(120 * 16 * ratio(key)))
+                painter.save()
+                painter.setClipRect(left, 0, width, 32)
+                self._draw_text(painter, center - 14, 23, text, 10, bold=True)
+                self._draw_text(painter, center - 11, 31, label, 7)
+                painter.restore()
+            elif mode == "minimal":
+                if index:
+                    painter.drawLine(left, 7, left, 25)
+                self._draw_text(painter, left + 4, 8, label, 7)
+                self._draw_text(painter, left + 4, 25, text, 15, bold=True)
+                painter.fillRect(left + 4, 29, int((width - 8) * ratio(key)), 2, QColor("white"))
+            elif mode == "hud":
+                painter.drawPolyline(QPolygonF([QPointF(left + 1, 7), QPointF(left + 7, 1),
+                    QPointF(right - 3, 1), QPointF(right - 3, 25), QPointF(right - 9, 31), QPointF(left + 1, 31)]))
+                self._draw_text(painter, left + 8, 9, label, 7, bold=True)
+                self._draw_text(painter, left + 8, 23, text, 12, bold=True)
+                for step in range(int(ratio(key) * max(1, (width - 16) // 5))):
+                    painter.fillRect(left + 8 + step * 5, 26, 3, 2, QColor("white"))
+            else:
+                if index:
+                    painter.drawLine(left, 1, left, 31)
+                heading = label + " " + text
+                temperature = state.get(key + "_temp") if key in ("cpu", "gpu") else None
+                if temperature is not None:
+                    heading += " " + _safe_number(temperature) + "C"
+                self._draw_text(painter, left + 3, 8, heading, 7, bold=True)
+                rect = QRectF(left + 2, 11, width - 5, 19)
+                painter.drawRect(rect)
+                graph(key, rect.adjusted(1, 1, -1, -1))
+        return
+
+
+    def _notification_allowed(self, app_name):
+        category = self._notification_category(str(app_name))
+        key = {"微信": "notify_wechat", "QQ": "notify_qq", "QQ邮箱": "notify_qqmail"}.get(category)
+        return key is None or bool(self._settings.get(key, True))
+
+    def _set_alert(self, app_name, text, force=False):
         with self._lock:
+            if not force and not self._notification_allowed(app_name):
+                return False
             self._alert = {
                 "app": str(app_name),
                 "text": str(text).strip()[:96],
                 "time": time.time(),
                 "until": time.monotonic() + 5.0,
+                "test": bool(force),
             }
+            return True
 
     def _system_loop(self):
         try:
@@ -425,6 +645,8 @@ class SceneEngine:
             self._stop_event.wait(1.0)
 
     def _query_nvidia(self):
+        if time.monotonic() < self._gpu_retry_at:
+            return None, None
         executable = "nvidia-smi.exe"
         try:
             result = subprocess.run(
@@ -440,10 +662,12 @@ class SceneEngine:
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             if result.returncode != 0 or not result.stdout.strip():
+                self._gpu_retry_at = time.monotonic() + 30.0
                 return None, None
             usage, temperature = result.stdout.splitlines()[0].split(",")[:2]
             return float(usage.strip()), float(temperature.strip())
         except Exception:
+            self._gpu_retry_at = time.monotonic() + 30.0
             return None, None
 
     def _query_cpu_temp(self):
@@ -599,7 +823,11 @@ class SceneEngine:
                 dtype="float32",
                 callback=callback,
             )
-            stream.start()
+            try:
+                stream.start()
+            except Exception:
+                stream.close()
+                raise
             with self._lock:
                 self._audio_stream = stream
                 self._audio_error = None
@@ -618,23 +846,25 @@ class SceneEngine:
         if mono.size < 32:
             return
         block = mono[-1024:] if mono.size >= 1024 else np.resize(mono, 1024)
-        window = np.hanning(block.size)
+        key = (block.size, samplerate)
+        plan = self._fft_plan
+        if plan is None or plan[0] != key:
+            window = np.hanning(block.size)
+            frequencies = np.fft.rfftfreq(block.size, 1.0 / samplerate)
+            edges = np.geomspace(35.0, min(18000.0, samplerate / 2), AUDIO_BARS + 1)
+            bands = [np.flatnonzero((frequencies >= edges[band]) &
+                                   (frequencies < edges[band + 1]))
+                     for band in range(AUDIO_BARS)]
+            indices = np.linspace(0, block.size - 1, 128).astype(int)
+            plan = (key, window, bands, indices)
+            self._fft_plan = plan
+        _, window, bands, indices = plan
         spectrum = np.abs(np.fft.rfft(block * window))
-        frequencies = np.fft.rfftfreq(block.size, 1.0 / samplerate)
-        edges = np.geomspace(
-            35.0,
-            min(18000.0, samplerate / 2),
-            AUDIO_BARS + 1,
-        )
         levels = []
-        for band in range(AUDIO_BARS):
-            mask = (frequencies >= edges[band]) & (
-                frequencies < edges[band + 1]
-            )
-            power = float(np.mean(spectrum[mask])) if np.any(mask) else 0.0
+        for band in bands:
+            power = float(np.mean(spectrum[band])) if band.size else 0.0
             db = 20.0 * math.log10(power + 1e-8)
             levels.append(_clamp((db + 62.0) / 50.0, 0.0, 1.0))
-        indices = np.linspace(0, block.size - 1, 128).astype(int)
         wave = np.clip(block[indices] * 5.0, -1.0, 1.0).tolist()
         rms = float(np.sqrt(np.mean(np.square(block)) + 1e-12))
         peak = float(np.max(np.abs(block)))
@@ -649,14 +879,20 @@ class SceneEngine:
         self._audio_capture_stop.set()
         with self._lock:
             stream = self._audio_stream
+            capture_thread = self._audio_capture_thread
             self._audio_stream = None
-            self._audio_capture_thread = None
+        if capture_thread is not None and capture_thread is not threading.current_thread():
+            capture_thread.join(timeout=2.0)
         if stream is not None:
             try:
                 stream.stop()
-                stream.close()
             except Exception:
                 pass
+            finally:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
 
     def _notification_loop(self):
         thread = threading.Thread(
@@ -736,7 +972,7 @@ class SceneEngine:
                 user32.GetWindowTextW(handle, buffer, length + 1)
                 process_id = ctypes.c_ulong()
                 user32.GetWindowThreadProcessId(handle, ctypes.byref(process_id))
-                windows.append((process_id.value, buffer.value))
+                windows.append((int(handle), process_id.value, buffer.value))
             return True
 
         callback = callback_type(collect_window)
@@ -747,22 +983,32 @@ class SceneEngine:
         while not self._stop_event.is_set():
             windows.clear()
             user32.EnumWindows(callback, 0)
-            for process_id, title in windows:
-                try:
-                    name = psutil.Process(process_id).name().casefold()
-                except Exception:
-                    continue
-                category = self._process_category(name)
-                if category is None:
-                    continue
-                previous = self._window_baseline.get((category, process_id))
-                self._window_baseline[(category, process_id)] = title
-                if previous is None or previous == title:
-                    continue
-                if self._looks_like_unread(title) and time.monotonic() - self._last_window_alert > 2.0:
-                    self._last_window_alert = time.monotonic()
-                    self._set_alert(category, self._clean_window_title(title, category))
+            self._check_window_notifications(windows, lambda pid: psutil.Process(pid).name())
             self._stop_event.wait(1.0)
+
+    def _check_window_notifications(self, windows, process_name):
+        baseline = {}
+        names = {}
+        for handle, process_id, title in windows:
+            if process_id not in names:
+                try:
+                    names[process_id] = process_name(process_id).casefold()
+                except Exception:
+                    names[process_id] = ""
+            category = self._process_category(names[process_id])
+            if category is None:
+                continue
+            # QQ can expose several windows in the same process. A per-process
+            # baseline makes unchanged titles appear to alternate indefinitely.
+            key = (category, process_id, handle)
+            previous = self._window_baseline.get(key)
+            baseline[key] = title
+            if previous is None or previous == title:
+                continue
+            if self._looks_like_unread(title) and time.monotonic() - self._last_window_alert > 2.0:
+                if self._set_alert(category, self._clean_window_title(title, category)):
+                    self._last_window_alert = time.monotonic()
+        self._window_baseline = baseline
 
     @staticmethod
     def _notification_category(app_name):
@@ -840,10 +1086,9 @@ class SceneEngine:
                             "dwm.exe",
                         }:
                             continue
-                        rows = self._fps_rows.setdefault(
-                            app, deque(maxlen=180)
-                        )
-                        rows.append((time.monotonic(), frame_ms))
+                        with self._lock:
+                            rows = self._fps_rows.setdefault(app, deque(maxlen=180))
+                            rows.append((time.monotonic(), frame_ms))
                     except Exception:
                         continue
             except OSError:
@@ -852,21 +1097,23 @@ class SceneEngine:
 
     def _update_fps_from_rows(self):
         now = time.monotonic()
-        best_app = None
+        with self._lock:
+            samples = {app: list(rows) for app, rows in self._fps_rows.items()}
+            for app, rows in samples.items():
+                if not rows or now - rows[-1][0] > 10.0:
+                    self._fps_rows.pop(app, None)
+        best_rows = []
         best_count = 0
-        for app, rows in list(self._fps_rows.items()):
+        for rows in samples.values():
             recent = [frame for stamp, frame in rows if now - stamp <= 2.0]
             if len(recent) > best_count:
                 best_count = len(recent)
-                best_app = app
-        if best_app is None or best_count < 4:
-            return
-        rows = [frame for stamp, frame in self._fps_rows[best_app] if now - stamp <= 2.0]
-        if not rows:
-            return
-        ordered = sorted(rows)
-        median = ordered[len(ordered) // 2]
-        fps = 1000.0 / median if median > 0 else None
+                best_rows = recent
+        fps = None
+        if best_count >= 4:
+            ordered = sorted(best_rows)
+            median = ordered[len(ordered) // 2]
+            fps = 1000.0 / median if median > 0 else None
         with self._lock:
             self._metrics["fps"] = round(fps, 1) if fps else None
             self._history["fps"].append(fps)

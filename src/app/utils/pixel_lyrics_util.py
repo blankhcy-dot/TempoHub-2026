@@ -15,6 +15,9 @@ import sys
 import tempfile
 import threading
 import time
+import logging
+from logging.handlers import RotatingFileHandler
+from collections import deque
 import unicodedata
 import urllib.parse
 import urllib.request
@@ -26,7 +29,8 @@ from app.utils import pixel_lyrics_util_orig as _orig
 from app.utils.pixel_lyrics_util_orig import *  # noqa: F401,F403
 from app.utils.pixel_lyrics_util_orig import PixelLyricsMonitor, parse_lrc_to_timeline
 from PyQt6.QtCore import QObject, QTimer, Qt, pyqtSignal, pyqtSlot
-from app.utils.tempo_scene_engine import SceneEngine
+from app.utils.tempo_scene_engine import AUDIO_MODES, PERFORMANCE_MODES, SceneEngine
+from app.utils.tempo_device_display import DeviceDisplay
 
 
 _SEARCH_URL = "https://music.163.com/api/search/get/web"
@@ -41,6 +45,16 @@ _HEADERS = {
     ),
 }
 _LOG_PATH = os.path.join(tempfile.gettempdir(), "tempo_hub_netease_lyrics.log")
+_LOG_WRITER = logging.getLogger("tempo-hub-plugin")
+_LOG_WRITER.setLevel(logging.INFO)
+_LOG_WRITER.propagate = False
+if not _LOG_WRITER.handlers:
+    _log_handler = RotatingFileHandler(_LOG_PATH, maxBytes=2 * 1024 * 1024, backupCount=2,
+                                      encoding="utf-8", delay=True)
+    _log_handler.setFormatter(logging.Formatter("%(message)s"))
+    _LOG_WRITER.addHandler(_log_handler)
+_DEVICE_REPORTS = deque(maxlen=64)
+_DEVICE_REPORTS_LOCK = threading.Lock()
 _SETTINGS_PATH = os.path.join(
     os.environ.get("APPDATA", tempfile.gettempdir()),
     "TempoHubLyrics",
@@ -77,17 +91,25 @@ _SCENE_PREPARE_REQUIRED = True
 _PIXEL_PROBE_MODEL = None
 _PROTOCOL_LOGGING_INSTALLED = False
 _SCENE_ENGINE = None
+_DEVICE_DISPLAY = None
+_DEVICE_OWNER = None
 _EQ_PROBE_MODEL = None
 _NETEASE_API_LOCK = threading.Lock()
 _NETEASE_API_BLOCK_UNTIL = 0.0
 _NETEASE_START_LOCK = threading.Lock()
 _NETEASE_START_ATTEMPTED = False
 _NETEASE_MODULE_STARTED_AT = time.monotonic()
+_SETTINGS_LOCK = threading.RLock()
+_SETTINGS_CACHE = None
+_SETTINGS_CACHE_PATH = None
+_SETTINGS_STAMP = None
+_SETTINGS_CHECK_AT = 0.0
 
 _DEFAULT_SETTINGS = {
     "enabled": True,
     "scene": "lyrics",
     "audio_mode": "bars",
+    "performance_mode": "tiles",
     "audio_sensitivity": 55,
     "notify_wechat": True,
     "notify_qq": True,
@@ -115,39 +137,113 @@ def _log(event, **fields):
             "event": event,
             **fields,
         }
-        with open(_LOG_PATH, "a", encoding="utf-8") as file:
-            file.write(json.dumps(record, ensure_ascii=False) + "\n")
+        _LOG_WRITER.info(json.dumps(record, ensure_ascii=False))
     except Exception:
         pass
+
+
+def _device_capability_fields(value, depth=0):
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if depth > 2:
+        return type(value).__name__
+    result = {}
+    for key in dir(value):
+        if key.startswith("_") or any(word in key.casefold() for word in ("token", "password", "mac")):
+            continue
+        try:
+            item = getattr(value, key)
+            if not callable(item):
+                result[key] = _device_capability_fields(item, depth + 1)
+        except Exception:
+            pass
+    return result
 
 
 def _load_settings():
-    settings = dict(_DEFAULT_SETTINGS)
-    try:
-        with open(_SETTINGS_PATH, "r", encoding="utf-8") as file:
-            stored = json.load(file)
-        if isinstance(stored, dict):
-            settings.update(stored)
-    except Exception:
-        pass
+    global _SETTINGS_CACHE, _SETTINGS_CACHE_PATH, _SETTINGS_STAMP, _SETTINGS_CHECK_AT
+    with _SETTINGS_LOCK:
+        now = time.monotonic()
+        if _SETTINGS_CACHE_PATH != _SETTINGS_PATH:
+            _SETTINGS_CACHE = None
+            _SETTINGS_STAMP = None
+            _SETTINGS_CHECK_AT = 0.0
+            _SETTINGS_CACHE_PATH = _SETTINGS_PATH
+        if _SETTINGS_CACHE is not None and now < _SETTINGS_CHECK_AT:
+            return dict(_SETTINGS_CACHE)
+        _SETTINGS_CHECK_AT = now + 1.0
+        try:
+            stat = os.stat(_SETTINGS_PATH)
+            stamp = (stat.st_mtime_ns, stat.st_size)
+            if _SETTINGS_CACHE is None or stamp != _SETTINGS_STAMP:
+                with open(_SETTINGS_PATH, "r", encoding="utf-8") as file:
+                    stored = json.load(file)
+                if not isinstance(stored, dict):
+                    raise ValueError("settings must be a JSON object")
+                settings = dict(_DEFAULT_SETTINGS)
+                settings.update(stored)
+                _SETTINGS_CACHE = _normalize_settings(settings)
+                _SETTINGS_STAMP = stamp
+        except (OSError, ValueError):
+            # Retain the last valid configuration during partial external edits.
+            if _SETTINGS_CACHE is None:
+                _SETTINGS_CACHE = dict(_DEFAULT_SETTINGS)
+        return dict(_SETTINGS_CACHE)
+
+
+def _normalize_settings(settings):
+    for key, low, high in (("line_offset_ms", -5000, 5000),
+                           ("audio_sensitivity", 20, 100), ("sound_mode", 0, 2)):
+        try:
+            settings[key] = max(low, min(high, int(settings.get(key, _DEFAULT_SETTINGS[key]))))
+        except (ValueError, TypeError, OverflowError):
+            settings[key] = _DEFAULT_SETTINGS[key]
+    for key, choices in (("scene", ("lyrics", "audio", "notifications", "performance")),
+                         ("audio_mode", AUDIO_MODES), ("performance_mode", PERFORMANCE_MODES)):
+        if settings.get(key) not in choices:
+            settings[key] = _DEFAULT_SETTINGS[key]
+    settings["engine"] = "native" if settings.get("scene", "lyrics") == "lyrics" else "custom"
     return settings
 
 
+def _shift_timeline(timeline, offset_ms):
+    # A positive offset means showing a line earlier, as described in the UI.
+    advance = float(offset_ms or 0) / 1000.0
+    return [(max(0.0, float(timestamp) - advance), text) for timestamp, text in timeline]
+
+
 def _save_settings(settings):
-    merged = _load_settings()
-    if isinstance(settings, dict):
-        merged.update(settings)
-    os.makedirs(os.path.dirname(_SETTINGS_PATH), exist_ok=True)
-    temporary = _SETTINGS_PATH + ".tmp"
-    with open(temporary, "w", encoding="utf-8") as file:
-        json.dump(merged, file, ensure_ascii=False, indent=2)
-    os.replace(temporary, _SETTINGS_PATH)
-    if _SCENE_ENGINE is not None:
+    global _SETTINGS_CACHE, _SETTINGS_STAMP, _SETTINGS_CHECK_AT
+    # Serialize the complete read/merge/replace cycle across HTTP workers.
+    with _SETTINGS_LOCK:
+        _SETTINGS_CHECK_AT = 0.0
+        merged = _load_settings()
+        if isinstance(settings, dict):
+            merged.update(settings)
+        merged = _normalize_settings(merged)
+        if merged == _SETTINGS_CACHE and os.path.isfile(_SETTINGS_PATH):
+            return dict(merged)
+        os.makedirs(os.path.dirname(_SETTINGS_PATH), exist_ok=True)
+        temporary = _SETTINGS_PATH + ".tmp"
         try:
-            _SCENE_ENGINE.configure(merged)
-        except Exception as error:
-            _log("scene_configure_error", error=str(error))
-    return merged
+            with open(temporary, "w", encoding="utf-8") as file:
+                json.dump(merged, file, ensure_ascii=False, indent=2)
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(temporary, _SETTINGS_PATH)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        _SETTINGS_CACHE = dict(merged)
+        stat = os.stat(_SETTINGS_PATH)
+        _SETTINGS_STAMP = (stat.st_mtime_ns, stat.st_size)
+        _SETTINGS_CHECK_AT = time.monotonic() + 1.0
+        if _SCENE_ENGINE is not None:
+            try:
+                _SCENE_ENGINE.configure(merged)
+            except Exception as error:
+                _log("scene_configure_error", error=str(error))
+        return dict(merged)
 
 
 _SCENE_ENGINE = SceneEngine(os.path.dirname(sys.executable), _log)
@@ -593,10 +689,14 @@ def _netease_progress_snapshot(playing=None):
         return sample
     updated = float(sample.get("updated") or 0.0)
     age = max(0.0, time.time() - updated)
-    if age > 2.0:
+    sample["stale"] = age > 2.0
+    if sample["stale"]:
         return sample
-    if playing and age > 0.05:
+    if playing and age > 0.05 and not sample.get("error"):
         sample["position"] = float(position) + min(age, 1.0)
+    duration = sample.get("duration")
+    if duration is not None and float(duration) > 0:
+        sample["position"] = min(float(duration), float(sample["position"]))
     return sample
 
 
@@ -821,6 +921,40 @@ def _install_protocol_logging():
     original_send = ECDriver.edifier_send_payload
     original_report = ECDriver.edifier_set_report
     original_receive = HzSoundBoxPixelMusicLyricModel.receive_data_from_usb
+    original_process = ECDriver._process_report
+    original_driver_receive = ECDriver.receive_data_from_usb
+    from app.frame.home.view.device.module_sound_box.view.sound_box_pixel_scene_model import SoundBoxPixelSceneModel
+    original_option_select = SoundBoxPixelSceneModel.set_option_select
+
+    def selected_scene_option(self, option_index, is_need_to_send_data=False, is_focus=False):
+        if _DEVICE_DISPLAY is not None and _DEVICE_DISPLAY.is_image_request_active():
+            # Our EF echoes must not trigger a second, competing vendor image
+            # download through the official scene model.
+            is_need_to_send_data = False
+        return original_option_select(self, option_index, is_need_to_send_data, is_focus)
+
+    def received_driver_report(self, report):
+        if _DEVICE_DISPLAY is not None:
+            _DEVICE_DISPLAY.feed_report(int(getattr(report, "index", -1)),
+                                        getattr(report, "payload", []) or [], source=id(self))
+        return original_driver_receive(self, report)
+
+    def logged_process(self, data):
+        try:
+            from driver.common import CmdReport
+            parsed = CmdReport(self.path, list(data))
+            code = getattr(parsed, "code", None)
+            index = int(getattr(parsed, "index", -1)) + (256 if code == 237 else 0)
+            record = {"at": time.monotonic(), "index": index, "code": code,
+                      "length": len(data)}
+            if index in (257, 258, 259, 232, 238, 239, 23):
+                record["payload"] = list(getattr(parsed, "payload", []) or [])[:64]
+                _log("device_protocol_rx", **record)
+            with _DEVICE_REPORTS_LOCK:
+                _DEVICE_REPORTS.append(record)
+        except Exception:
+            pass
+        return original_process(self, data)
 
     def logged_send(self, index, payload=None, is_retry=False, *args, **kwargs):
         try:
@@ -881,8 +1015,113 @@ def _install_protocol_logging():
 
     ECDriver.edifier_send_payload = logged_send
     ECDriver.edifier_set_report = logged_report
+    ECDriver._process_report = logged_process
+    ECDriver.receive_data_from_usb = received_driver_report
+    SoundBoxPixelSceneModel.set_option_select = selected_scene_option
     HzSoundBoxPixelMusicLyricModel.receive_data_from_usb = logged_receive
     _PROTOCOL_LOGGING_INSTALLED = True
+
+
+class _DeviceTransport:
+    def __init__(self, driver, device):
+        self.driver = driver
+        self.key = id(driver)
+        features = getattr(device, "func_bean", None)
+        if getattr(device, "product_id", None) != 0xA160:
+            raise RuntimeError("当前型号的像素屏协议尚未验证")
+        if not getattr(getattr(features, "b25", None), "is_support_pixel_screen", False):
+            raise RuntimeError("当前设备未提供像素屏功能")
+        self.protocol = ("ed_canvas" if getattr(getattr(features, "b28", None),
+                                               "is_support_pixel_screen_feature", False) else "legacy_ec")
+
+    def send(self, command, payload=None):
+        if command == "query":
+            return self.driver.pixel_screen_query()
+        if command == "screen":
+            return self.driver.pixel_screen_set(payload, is_retry=False)
+        if command == "image":
+            return self.driver.pixel_screen_custom_image_set(payload, is_retry=False)
+        if command == "text":
+            return self.driver.device_text_set(payload)
+        raise ValueError("未知设备操作")
+
+
+def _get_device_owner():
+    global _DEVICE_OWNER
+    from driver.edifier_driver import ECDriver
+    from PyQt6.QtWidgets import QApplication
+    candidates = [_DEVICE_OWNER, _QQ_MODEL]
+    if _DEVICE_OWNER is None:
+        candidates.extend(getattr(widget, "model", None) for widget in QApplication.allWidgets())
+    for owner in candidates:
+        device = getattr(owner, "mdevice", None)
+        if device is None or getattr(device, "product_id", None) != 0xA160:
+            continue
+        try:
+            driver = owner.driver(ECDriver)
+            if driver and driver.running and not driver.is_device_deleted:
+                _DEVICE_OWNER = owner
+                return owner
+        except (AttributeError, RuntimeError):
+            continue
+    _DEVICE_OWNER = None
+    raise RuntimeError("音响未连接，请检查 USB 数据线")
+
+
+def _device_transport():
+    from driver.edifier_driver import ECDriver
+    owner = _get_device_owner()
+    return _DeviceTransport(owner.driver(ECDriver), owner.mdevice)
+
+
+def _device_frame(scene):
+    if _SCENE_ENGINE is None:
+        raise RuntimeError("显示模块正在启动，请稍后重试")
+    return _SCENE_ENGINE.render_matrix(scene)
+
+
+def _device_lyric_text():
+    return (getattr(_ACTIVE_MONITOR, "_last_lyric_line", None)
+            or getattr(_ACTIVE_MONITOR, "_last_title", None) or "等待播放音乐")
+
+
+def _display_snapshot():
+    if _DEVICE_DISPLAY is None:
+        return {"connected": False, "pending": False, "verified": False,
+                "scene": None, "phase": "starting", "last_error": "设备正在连接"}
+    return _DEVICE_DISPLAY.snapshot()
+
+
+def _run_device_job(kind, timeout=3.0, **fields):
+    if _CANVAS_BRIDGE is None:
+        raise RuntimeError("设备控制模块正在启动，请稍后重试")
+    job = {"kind": kind, "done": threading.Event(), "expires_at": time.monotonic() + timeout, **fields}
+    _CANVAS_JOBS.put(job)
+    if not job["done"].wait(timeout):
+        raise RuntimeError("设备线程未响应，请稍后重试")
+    if job.get("error"):
+        raise RuntimeError(job["error"])
+    return job.get("result")
+
+
+def _apply_device_display(settings, force=True):
+    request = _run_device_job("display_submit", settings=dict(settings), force=force)
+    if not request.done.wait(6.0):
+        raise RuntimeError("音响未确认显示，请检查连接后重新应用")
+    if request.error:
+        raise RuntimeError(request.error)
+    return request.result
+
+
+def _apply_lyric_offset(offset_ms):
+    monitor = _ACTIVE_MONITOR
+    base = getattr(monitor, "_netease_base_timeline", None) if monitor else None
+    if base:
+        monitor._current_timeline = _shift_timeline(base, offset_ms)
+        monitor._netease_timeline_times = [float(stamp) for stamp, _ in monitor._current_timeline]
+        monitor._netease_line_index = None
+        monitor._last_lyric_line = None
+        monitor._locate_and_send_lyric()
 
 
 class _CanvasBridge(QObject):
@@ -892,9 +1131,106 @@ class _CanvasBridge(QObject):
         super().__init__()
         self.request.connect(self.handle)
 
+    def initialize(self):
+        global _CANVAS_TIMER, _DEVICE_DISPLAY
+        if _CANVAS_TIMER is not None:
+            return
+        _DEVICE_DISPLAY = DeviceDisplay(_device_transport, _device_frame, _device_lyric_text, _log)
+        _CANVAS_TIMER = QTimer(self)
+        _CANVAS_TIMER.setTimerType(Qt.TimerType.PreciseTimer)
+        _CANVAS_TIMER.setInterval(10)
+        _CANVAS_TIMER.timeout.connect(_poll_canvas_jobs)
+        _CANVAS_TIMER.start()
+        _log("device_control_started")
+
     @pyqtSlot(object)
     def handle(self, job):
         global _CANVAS_MODEL, _CANVAS_WALLPAPER_ID, _QQ_MODEL
+        if job.get("kind") == "initialize":
+            self.initialize()
+            return
+        if job.get("kind") == "display_submit":
+            try:
+                settings = job["settings"]
+                job["result"] = _DEVICE_DISPLAY.submit(settings.get("scene", "lyrics"), settings,
+                                                        force=job.get("force", True))
+            except Exception as error:
+                job["error"] = str(error)
+            finally:
+                job["done"].set()
+            return
+        if job.get("kind") == "apply_offset":
+            try:
+                _apply_lyric_offset(job["offset_ms"])
+                job["result"] = True
+            except Exception as error:
+                job["error"] = str(error)
+            finally:
+                job["done"].set()
+            return
+        if job.get("kind") in ("eq_info", "eq_preset"):
+            try:
+                if job["kind"] == "eq_info":
+                    from driver.edifier_driver import ECDriver
+                    owner = _get_qq_model()
+                    driver = owner.driver(ECDriver)
+                    job["result"] = {"product_id": getattr(owner.mdevice, "product_id", None),
+                                      "eq_index": getattr(getattr(owner.mdevice, "func_bean", None), "eq", None),
+                                      "driver_ready": bool(driver and driver.running),
+                                      "custom_eq_probe": {"supported": None,
+                                          "error": "当前设备尚无经过验证的自定义 EQ 查询"}}
+                else:
+                    job["result"] = _set_eq_preset(job["index"])
+            except Exception as error:
+                job["error"] = str(error)
+            finally:
+                job["done"].set()
+            return
+        if job.get("kind") == "legacy_ready_probe":
+            from driver.edifier_driver import ECDriver
+            index = int(job.get("device_index", 0))
+            if index not in (0, 1):
+                return False
+            _get_qq_model().driver(ECDriver).pixel_screen_custom_image_set([index, 0, 0, 0, 4, 40])
+            _log("legacy_image_ready_probe_sent", device_index=index)
+            return True
+        if job.get("kind") == "device_snapshot":
+            try:
+                from driver.edifier_driver import ECDriver
+                model = _get_device_owner()
+                driver = model.driver(ECDriver)
+                from PyQt6.QtWidgets import QApplication
+                from PyQt6.QtCore import QThread
+                gui_thread = QApplication.instance().thread()
+                if job.get("refresh"):
+                    driver.pixel_screen_query()
+                with _DEVICE_REPORTS_LOCK:
+                    reports = list(_DEVICE_REPORTS)
+                job["result"] = {
+                    "driver_type": type(driver).__name__,
+                    "product_id": getattr(model.mdevice, "product_id", None),
+                    "capabilities": _device_capability_fields(getattr(model.mdevice, "func_bean", None)),
+                    "driver_fields": sorted(getattr(driver, "__dict__", {})),
+                    "driver_running": bool(getattr(driver, "running", False)),
+                    "driver_paused": bool(getattr(driver, "is_send_pause", False)),
+                    "driver_interval": getattr(driver, "thread_run_min_interval", None),
+                    "executing_on_gui_thread": QThread.currentThread() == gui_thread,
+                    "bridge_on_gui_thread": self.thread() == gui_thread,
+                    "owner_on_gui_thread": model.thread() == gui_thread,
+                    "display": _display_snapshot(),
+                    "queue_size": getattr(getattr(driver, "send_queue", None), "qsize", lambda: None)(),
+                    "retry_commands": list(getattr(driver, "send_cmd_cache", {})),
+                    "canvas": {key: getattr(model, key, None) for key in (
+                        "mode_group_index", "current_wallpaper_index", "wallpaper_combo_data",
+                        "_is_ed03_running", "_canvas_send_offset", "_canvas_packet_index",
+                        "_canvas_packets_sent_in_group", "_pending_home_wallpaper_index")},
+                    "recent_reports": reports,
+                }
+            except Exception as error:
+                job["error"] = str(error)
+            finally:
+                job["done"].set()
+            return
         _log(
             "canvas_handle_received",
             text=job.get("text", ""),
@@ -987,6 +1323,9 @@ def _ensure_canvas_model():
 
 def _ensure_canvas_model_safe():
     try:
+        features = getattr(_get_qq_model().mdevice, "func_bean", None)
+        if not getattr(getattr(features, "b28", None), "is_support_pixel_screen_feature", False):
+            return
         _ensure_canvas_model()
     except Exception as error:
         _log("canvas_preinit_error", error=str(error))
@@ -999,9 +1338,8 @@ def _ensure_native_lyrics_safe():
             settings.get("scene", "lyrics") == "lyrics"
             and settings.get("engine") == "native"
         ):
-            _force_native_lyrics(
-                settings.get("lyrics_display_mode", 1)
-            )
+            if _DEVICE_DISPLAY is not None:
+                _DEVICE_DISPLAY.submit("lyrics", settings, force=True)
     except Exception as error:
         _log("native_lyrics_startup_error", error=str(error))
 
@@ -1115,52 +1453,28 @@ def _request_scene_display():
 
 
 def _poll_canvas_jobs():
-    global _SCENE_LAST_SEND, _SCENE_SHOW_PENDING, _SCENE_PREPARE_REQUIRED
-    latest = None
+    if _CANVAS_BRIDGE is None or _DEVICE_DISPLAY is None:
+        return
     while True:
         try:
-            latest = _CANVAS_JOBS.get_nowait()
+            job = _CANVAS_JOBS.get_nowait()
         except queue.Empty:
             break
-    if latest is not None and _CANVAS_BRIDGE is not None:
-        _CANVAS_BRIDGE.handle(latest)
-        return
-    if _SCENE_ENGINE is None or _CANVAS_BRIDGE is None:
-        return
-    settings = _load_settings()
-    scene = str(settings.get("scene", "lyrics"))
-    if scene != "lyrics" and _SCENE_PREPARE_REQUIRED:
-        _SCENE_PREPARE_REQUIRED = False
-        _prepare_scene_display()
-        return
-    if (
-        scene == "lyrics"
-        or time.time() < _SCENE_RENDER_NOT_BEFORE
-        or time.time() - _SCENE_LAST_SEND < 0.16
-    ):
-        return
+        if time.monotonic() > job.get("expires_at", float("inf")):
+            job["error"] = "设备操作已超时，未执行过期请求"
+            if job.get("done") is not None:
+                job["done"].set()
+            continue
+        _CANVAS_BRIDGE.handle(job)
     try:
-        model_was_none = _CANVAS_MODEL is None
-        model = _ensure_canvas_model()
-        if model_was_none:
-            _prepare_scene_display()
-            return
-        if getattr(model, "_is_ed03_running", False):
-            return
-        matrix = _SCENE_ENGINE.render_matrix(scene)
-        if matrix:
-            _SCENE_LAST_SEND = time.time()
-            queued = _CANVAS_BRIDGE.handle(
-                {
-                    "matrix": matrix,
-                    "scene": scene,
-                    "show": _SCENE_SHOW_PENDING,
-                }
-            )
-            if queued:
-                _SCENE_SHOW_PENDING = False
+        # Continuous uploads remain disabled until the classic transfer has
+        # been verified on hardware. Explicit requests still run to completion.
+        _DEVICE_DISPLAY.tick(_load_settings(), auto_refresh=False)
+        interval = 10 if _DEVICE_DISPLAY.snapshot()["pending"] else 50
+        if _CANVAS_TIMER.interval() != interval:
+            _CANVAS_TIMER.setInterval(interval)
     except Exception as error:
-        _log("scene_render_error", scene=scene, error=str(error))
+        _log("device_tick_error", error=str(error))
 
 
 class _LocalApiHandler(BaseHTTPRequestHandler):
@@ -1172,10 +1486,28 @@ class _LocalApiHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(5.0)
 
     def do_GET(self):
+        if self.path.partition("?")[0] == "/api/device":
+            job = {"kind": "device_snapshot", "done": threading.Event(), "refresh": "refresh=1" in self.path}
+            _CANVAS_JOBS.put(job)
+            if not job["done"].wait(3.0):
+                self._send(504, {"error": "设备线程未响应"})
+            elif job.get("error"):
+                self._send(503, {"error": job["error"]})
+            else:
+                self._send(200, job["result"])
+            return
         if self.path == "/api/settings":
             self._send(200, _load_settings())
             return
@@ -1184,11 +1516,8 @@ class _LocalApiHandler(BaseHTTPRequestHandler):
             progress = _netease_progress_snapshot(
                 bool(getattr(monitor, "_evt_is_playing", None))
             )
-            lyric_model = None
-            try:
-                lyric_model = _lyric_model_state(_get_lyric_model())
-            except Exception as error:
-                lyric_model = {"error": str(error)}
+            display = _display_snapshot()
+            lyric_model = display.get("lyrics", {})
             self._send(
                 200,
                 {
@@ -1204,14 +1533,13 @@ class _LocalApiHandler(BaseHTTPRequestHandler):
                     ),
                     "netease_progress": progress,
                     "lyric_model": lyric_model,
+                    "display": display,
                     "is_playing": (
                         getattr(monitor, "_evt_is_playing", None) if monitor else None
                     ),
                     "last_render": _LAST_RENDER,
-                    "canvas_ready": _CANVAS_MODEL is not None,
-                    "canvas_sending": bool(
-                        getattr(_CANVAS_MODEL, "_is_ed03_running", False)
-                    ),
+                    "canvas_ready": display.get("connected", False),
+                    "canvas_sending": display.get("pending", False),
                     "canvas_wallpaper_count": len(
                         getattr(_CANVAS_MODEL, "wallpaper_combo_data", []) or []
                     ),
@@ -1247,6 +1575,8 @@ class _LocalApiHandler(BaseHTTPRequestHandler):
                 200,
                 {
                     "scene": scene,
+                    "audio_mode": settings.get("audio_mode", "bars"),
+                    "performance_mode": settings.get("performance_mode", "tiles"),
                     "width": 256,
                     "height": 32,
                     "matrix": base64.b64encode(packed).decode("ascii"),
@@ -1309,16 +1639,22 @@ class _LocalApiHandler(BaseHTTPRequestHandler):
         self._send(404, {"error": "not found"})
 
     def do_POST(self):
-        length = min(1024 * 1024, int(self.headers.get("Content-Length", "0")))
         try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= 64 * 1024:
+                self._send(413, {"error": "request body must be 1 to 65536 bytes"})
+                return
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
-        except Exception:
+            if not isinstance(payload, dict):
+                raise ValueError("expected JSON object")
+        except (ValueError, UnicodeError, OSError):
             self._send(400, {"error": "invalid json"})
             return
 
         if self.path == "/api/settings":
             try:
-                previous_scene = _load_settings().get("scene", "lyrics")
+                previous_settings = _load_settings()
+                previous_scene = previous_settings.get("scene", "lyrics")
                 reapply_device = bool(payload.get("reapply_device", True))
                 stored_payload = {
                     key: value
@@ -1327,46 +1663,27 @@ class _LocalApiHandler(BaseHTTPRequestHandler):
                 }
                 settings = _save_settings(stored_payload)
                 scene = str(settings.get("scene", "lyrics"))
-                monitor = _ACTIVE_MONITOR
-                base_timeline = getattr(
-                    monitor, "_netease_base_timeline", None
-                ) if monitor else None
-                if base_timeline:
-                    offset_seconds = (
-                        float(settings.get("line_offset_ms", 0) or 0) / 1000.0
-                    )
-                    monitor._current_timeline = [
-                        (max(0.0, timestamp + offset_seconds), text)
-                        for timestamp, text in base_timeline
-                    ]
-                    monitor._netease_timeline_times = [
-                        float(timestamp)
-                        for timestamp, _ in monitor._current_timeline
-                    ]
-                    monitor._netease_line_index = None
-                    monitor._last_lyric_line = None
-                    monitor._locate_and_send_lyric()
-                result = {"settings": settings}
-                if scene == "lyrics" and reapply_device:
-                    _cancel_scene_home_commit()
-                    result["device"] = _force_native_lyrics(
-                        settings.get("lyrics_display_mode", 1)
-                    )
-                    _save_settings({"engine": "native"})
-                elif scene != "lyrics":
-                    settings = _save_settings({"engine": "custom"})
-                    result["settings"] = settings
-                    if previous_scene != scene:
-                        _log("scene_changed", scene=scene)
-                    _request_scene_display()
+                if reapply_device and settings == previous_settings and _SCENE_ENGINE is not None:
+                    _SCENE_ENGINE.configure(settings)
+                if settings.get("line_offset_ms") != previous_settings.get("line_offset_ms"):
+                    _run_device_job("apply_offset", offset_ms=settings.get("line_offset_ms", 0))
+                display_changed = any(settings.get(key) != previous_settings.get(key)
+                                      for key in stored_payload if key not in ("line_offset_ms", "sound_mode"))
+                apply_display = settings.get("enabled", True) and (reapply_device or display_changed)
+                result = {"settings": settings, "applied": bool(apply_display)}
+                if apply_display:
+                    result["display"] = _apply_device_display(settings, force=reapply_device or previous_scene != scene)
+                else:
+                    result["display"] = _display_snapshot()
                 self._send(200, result)
             except Exception as error:
                 self._send(500, {"error": str(error)})
             return
         if self.path == "/api/test-canvas":
             try:
-                _dispatch_canvas(payload)
-                self._send(202, {"status": "queued"})
+                settings = dict(_load_settings(), scene=payload.get("scene", "performance"))
+                result = _apply_device_display(settings)
+                self._send(200, {"display": result})
             except Exception as error:
                 self._send(500, {"error": str(error)})
             return
@@ -1378,9 +1695,8 @@ class _LocalApiHandler(BaseHTTPRequestHandler):
                     {
                         "status": "native",
                         "settings": settings,
-                        "device": _force_native_lyrics(
-                            settings.get("lyrics_display_mode", 1)
-                        ),
+                        "display": _apply_device_display(settings),
+                        "applied": True,
                     },
                 )
             except Exception as error:
@@ -1749,7 +2065,7 @@ def _locate_and_send_lyric(self, provided_position=None):
 
 
 def _start(self):
-    global _ACTIVE_MONITOR, _CANVAS_TIMER, _QQ_MODEL
+    global _ACTIVE_MONITOR, _CANVAS_TIMER, _QQ_MODEL, _CANVAS_BRIDGE, _DEVICE_DISPLAY
     _ACTIVE_MONITOR = self
     callback_owner = getattr(getattr(self, "_on_lyric_changed", None), "__self__", None)
     if callback_owner is not None:
@@ -1759,14 +2075,9 @@ def _start(self):
             callback_owner, type(callback_owner)
         )
     if _CANVAS_TIMER is None:
-        _CANVAS_TIMER = QTimer()
-        _CANVAS_TIMER.setInterval(100)
-        _CANVAS_TIMER.timeout.connect(_poll_canvas_jobs)
-        _CANVAS_TIMER.start()
-        _log("canvas_timer_started")
-        QTimer.singleShot(2000, _ensure_canvas_model_safe)
-        QTimer.singleShot(3000, _ensure_native_lyrics_safe)
-        QTimer.singleShot(1200, _ensure_netease_running_async)
+        if _CANVAS_BRIDGE is None:
+            _CANVAS_BRIDGE = _CanvasBridge()
+        _CANVAS_BRIDGE.initialize()
     return _original_start(self)
 
 
@@ -1908,15 +2219,9 @@ def _fetch_and_parse_lyric_sync(
                     self._netease_base_timeline = list(timeline)
                     self._netease_line_index = None
                     self._netease_wait_until = time.time() + 0.55
-                    offset_seconds = (
-                        float(_load_settings().get("line_offset_ms", 0) or 0)
-                        / 1000.0
+                    timeline = _shift_timeline(
+                        timeline, _load_settings().get("line_offset_ms", 0)
                     )
-                    if offset_seconds:
-                        timeline = [
-                            (max(0.0, timestamp + offset_seconds), text)
-                            for timestamp, text in timeline
-                        ]
                     self._current_timeline = timeline
                     self._netease_timeline_times = [
                         float(timestamp) for timestamp, _ in timeline
@@ -1950,7 +2255,11 @@ PixelLyricsMonitor._fetch_and_parse_lyric_sync = _fetch_and_parse_lyric_sync
 PixelLyricsMonitor.start = _start
 PixelLyricsMonitor._locate_and_send_lyric = _locate_and_send_lyric
 
-_CANVAS_BRIDGE = _CanvasBridge()
 _install_protocol_logging()
+from PyQt6.QtCore import QCoreApplication
+if QCoreApplication.instance() is not None:
+    _CANVAS_BRIDGE = _CanvasBridge()
+    _CANVAS_BRIDGE.moveToThread(QCoreApplication.instance().thread())
+    _CANVAS_BRIDGE.request.emit({"kind": "initialize"})
 _start_netease_progress_bridge()
 _start_local_api()

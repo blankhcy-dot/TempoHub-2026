@@ -16,6 +16,11 @@ if (-not (Test-Path -LiteralPath $runtime)) {
     Expand-Archive -LiteralPath $archive -DestinationPath $runtime
 }
 
+& (Join-Path $runtime "python.exe") (Join-Path $root "scripts\compile_payload.py")
+if ($LASTEXITCODE -ne 0) {
+    throw "Python 3.9 payload compilation failed."
+}
+
 & $Python -m PyInstaller `
     --noconfirm `
     --clean `
@@ -31,3 +36,6 @@ if (-not (Test-Path -LiteralPath $runtime)) {
     --hidden-import "PyInstaller.archive.readers" `
     --hidden-import "PyInstaller.archive.writers" `
     "$root\installer.py"
+if ($LASTEXITCODE -ne 0) {
+    throw "Installer build failed."
+}
