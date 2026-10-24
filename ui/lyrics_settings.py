@@ -1910,16 +1910,40 @@ class SettingsWindow(QMainWindow):
         self._apply_scene_options(on_success=on_success, on_failure=on_failure)
 
     def _test_notification(self, app_name, text):
+        if not self._settings_loaded:
+            self._set_chip(self.notification_status, "正在读取设置，请稍后重试", "warn")
+            return
+        self.scene_apply_timer.stop()
+        self.offset_apply_timer.stop()
+        self._suppress_scene_change = True
+        try:
+            self.nav.setCurrentRow(2)
+            self.pages.setCurrentIndex(2)
+            self._desired_scene = "notifications"
+        finally:
+            self._suppress_scene_change = False
+        self._edit_revision += 1
+        revision = self._scene_revision
+        edit_revision = self._edit_revision
+        settings = self._settings_payload(reapply_device=True)
+        self._set_chip(self.notification_status, "正在发送测试通知…", "muted")
+
         def completed(result, error):
+            if not error and not (result.get("display") or {}).get("verified"):
+                error = RuntimeError("音响尚未确认显示通知")
             if error:
                 self._set_chip(self.notification_status, "测试失败，请重试", "warn")
                 self.notification_status.setToolTip(str(error))
                 return
+            self.settings.update(result.get("settings", {}))
+            self._update_active_scene("notifications")
             self.notification_latest.setText(f"{app_name} · {text}")
+            self.notification_status.setToolTip("")
             self._set_chip(self.notification_status, "测试通知已发送", "good")
-        self._activate_scene_page(2, on_success=lambda: self.api.post(
-            "/api/notifications/test", {"app": app_name, "text": text}, completed,
-            timeout=3.0, followup=True), on_failure=lambda error: completed(None, error))
+            if revision == self._scene_revision and edit_revision == self._edit_revision:
+                self.feedback.setText("音响已确认显示通知，设置已保存")
+        self.api.post("/api/notifications/test", {"app": app_name, "text": text, "settings": settings},
+                      completed, timeout=12.0)
 
     def _start_fps_capture(self):
         self.fps_button.setEnabled(False)
@@ -2127,7 +2151,7 @@ class SettingsWindow(QMainWindow):
                 self._suppress_scene_change = False
                 self._desired_scene = "lyrics"
                 self.feedback.setText("已重新开启设备歌词")
-        self.api.post("/api/restore-native", {}, restored)
+        self.api.post("/api/restore-native", {}, restored, timeout=12.0)
 
     def _set_chip(self, label, text, state):
         names = {

@@ -84,6 +84,7 @@ class SceneEngine:
         self._metric_error = None
         self._cpu_temp_checked = False
         self._alert = None
+        self._notification_revision = 0
         self._notification_status = "正在连接 Windows 通知"
         self._notification_error = None
         self._seen_notifications = set()
@@ -119,6 +120,7 @@ class SceneEngine:
                 if (self._alert and not self._alert.get("test")
                         and not self._notification_allowed(self._alert.get("app", ""))):
                     self._alert = None
+                    self._notification_revision = getattr(self, "_notification_revision", 0) + 1
             with self._render_lock:
                 self._render_cache = None
             if scene == "audio":
@@ -164,6 +166,13 @@ class SceneEngine:
     def trigger_notification(self, app_name, text):
         # A local test is an explicit action, independent of passive monitoring.
         self._set_alert(app_name, text, force=True)
+
+    def notification_display_state(self):
+        with self._lock:
+            if self._alert and time.monotonic() >= float(self._alert.get("until", 0.0)):
+                self._alert = None
+                self._notification_revision = getattr(self, "_notification_revision", 0) + 1
+            return {"revision": getattr(self, "_notification_revision", 0), "active": bool(self._alert)}
 
     def start_fps_capture(self):
         with self._fps_start_lock:
@@ -226,12 +235,14 @@ class SceneEngine:
         # The device and settings preview can request the same frame at once.
         with self._render_lock:
             scene = scene or self._settings.get("scene", "lyrics")
+            with self._lock:
+                cache_key = (scene, getattr(self, "_notification_revision", 0) if scene == "notifications" else None)
             now = time.monotonic()
             cached = self._render_cache
-            if cached is not None and cached[0] == scene and now - cached[1] < 0.08:
+            if cached is not None and cached[0] == cache_key and now - cached[1] < 0.08:
                 return cached[2]
             matrix = self._render_matrix(scene)
-            self._render_cache = (scene, now, matrix)
+            self._render_cache = (cache_key, now, matrix)
             return matrix
 
     def _render_matrix(self, scene):
@@ -597,6 +608,7 @@ class SceneEngine:
                 "until": time.monotonic() + 5.0,
                 "test": bool(force),
             }
+            self._notification_revision = getattr(self, "_notification_revision", 0) + 1
             return True
 
     def _system_loop(self):

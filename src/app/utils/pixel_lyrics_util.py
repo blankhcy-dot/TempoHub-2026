@@ -93,6 +93,8 @@ _PIXEL_PROBE_MODEL = None
 _PROTOCOL_LOGGING_INSTALLED = False
 _SCENE_ENGINE = None
 _DEVICE_DISPLAY = None
+_NOTIFICATION_REFRESH = {"revision": None, "submitted_revision": None,
+                         "request": None, "failures": 0, "retry_at": 0.0}
 _DEVICE_OWNER = None
 _EQ_PROBE_MODEL = None
 _EQ_PROBE_LOCK = threading.Lock()
@@ -1133,7 +1135,10 @@ def _run_device_job(kind, timeout=3.0, **fields):
 
 def _apply_device_display(settings, force=True):
     request = _run_device_job("display_submit", settings=dict(settings), force=force)
-    if not request.done.wait(6.0):
+    # A prior frame can still be finishing before this request starts. Each
+    # transfer has a 4.5 s bound; cover both without reporting a queued success
+    # as a timeout while the newer frame is still being sent.
+    if not request.done.wait(10.0):
         raise RuntimeError("音响未确认显示，请检查连接后重新应用")
     if request.error:
         raise RuntimeError(request.error)
@@ -1498,6 +1503,42 @@ def _request_scene_display():
     _SCENE_PREPARE_REQUIRED = True
 
 
+def _refresh_notification_display(settings, display):
+    if _SCENE_ENGINE is None:
+        return
+    notification = _SCENE_ENGINE.notification_display_state()
+    revision = notification["revision"]
+    refresh = _NOTIFICATION_REFRESH
+    request = refresh["request"]
+    if request is not None and request.done.is_set():
+        if request.error:
+            refresh["failures"] += 1
+            refresh["retry_at"] = time.monotonic() + min(8.0, 2.0 ** refresh["failures"])
+        else:
+            refresh["revision"] = refresh["submitted_revision"]
+            refresh["failures"] = 0
+        refresh["request"] = None
+    if settings.get("scene") != "notifications" or not settings.get("enabled", True):
+        refresh["revision"] = None
+        refresh["failures"] = 0
+        return
+    if not display.get("connected"):
+        refresh["revision"] = None
+        refresh["failures"] = 0
+        refresh["retry_at"] = 0.0
+        return
+    if revision != refresh["submitted_revision"]:
+        refresh["failures"] = 0
+        refresh["retry_at"] = 0.0
+    if display.get("scene") != "notifications":
+        refresh["revision"] = None
+    if (refresh["request"] is None and revision != refresh["revision"]
+            and not display.get("pending") and refresh["failures"] < 3
+            and time.monotonic() >= refresh["retry_at"]):
+        refresh["submitted_revision"] = revision
+        refresh["request"] = _DEVICE_DISPLAY.submit("notifications", settings, force=False)
+
+
 def _poll_canvas_jobs():
     if _CANVAS_BRIDGE is None or _DEVICE_DISPLAY is None:
         return
@@ -1515,7 +1556,9 @@ def _poll_canvas_jobs():
     try:
         # Continuous uploads remain disabled until the classic transfer has
         # been verified on hardware. Explicit requests still run to completion.
-        _DEVICE_DISPLAY.tick(_load_settings(), auto_refresh=False)
+        settings = _load_settings()
+        _DEVICE_DISPLAY.tick(settings, auto_refresh=False)
+        _refresh_notification_display(settings, _DEVICE_DISPLAY.snapshot())
         interval = 10 if _DEVICE_DISPLAY.snapshot()["pending"] else 50
         if _CANVAS_TIMER.interval() != interval:
             _CANVAS_TIMER.setInterval(interval)
@@ -1754,11 +1797,20 @@ class _LocalApiHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/api/notifications/test":
             try:
+                incoming_settings = payload.get("settings", {})
+                if not isinstance(incoming_settings, dict):
+                    raise ValueError("通知设置必须为 JSON 对象")
+                previous = _load_settings()
+                updates = {key: value for key, value in incoming_settings.items() if key != "reapply_device"}
+                settings = _save_settings(dict(updates, scene="notifications", enabled=True))
+                if settings.get("line_offset_ms") != previous.get("line_offset_ms"):
+                    _run_device_job("apply_offset", offset_ms=settings.get("line_offset_ms", 0))
                 _SCENE_ENGINE.trigger_notification(
                     str(payload.get("app") or "微信"),
                     str(payload.get("text") or "这是一条测试消息"),
                 )
-                self._send(202, {"status": "queued"})
+                display = _apply_device_display(settings)
+                self._send(200, {"status": "shown", "settings": settings, "applied": True, "display": display})
             except Exception as error:
                 self._send(500, {"error": str(error)})
             return
