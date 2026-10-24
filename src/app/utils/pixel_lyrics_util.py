@@ -68,6 +68,7 @@ _CANVAS_WALLPAPER_ID = None
 _LAST_RENDER = {}
 _CANVAS_JOBS = queue.Queue()
 _CANVAS_TIMER = None
+_BRIDGE_START_LOCK = threading.Lock()
 _NETEASE_PROGRESS = {
     "position": None,
     "duration": None,
@@ -94,6 +95,7 @@ _SCENE_ENGINE = None
 _DEVICE_DISPLAY = None
 _DEVICE_OWNER = None
 _EQ_PROBE_MODEL = None
+_EQ_PROBE_LOCK = threading.Lock()
 _NETEASE_API_LOCK = threading.Lock()
 _NETEASE_API_BLOCK_UNTIL = 0.0
 _NETEASE_START_LOCK = threading.Lock()
@@ -727,19 +729,20 @@ def _get_qq_model():
     return model
 
 
-def _probe_custom_eq(timeout=3.0):
+def _begin_custom_eq_probe():
     global _EQ_PROBE_MODEL
     from app.frame.home.view.device.module_sound_box.view.sound_box_eq_diy_no_file_model import (
         SoundBoxEqDiyNoFileModel,
     )
     from driver.edifier_driver import ECDriver, CommandIndexType
-    from interface.client.ec_parse import custom_eq_query_analysis
 
     class ProbeModel(SoundBoxEqDiyNoFileModel):
         def __init__(self):
             super().__init__()
             self.probe_payload = None
             self.probe_event = threading.Event()
+            self.probe_result = None
+            self.probe_device_key = None
 
         def receive_data_from_usb(self, report):
             if getattr(report, "index", None) == CommandIndexType.CM_43.value:
@@ -747,35 +750,55 @@ def _probe_custom_eq(timeout=3.0):
                 self.probe_event.set()
             return super().receive_data_from_usb(report)
 
-    model = ProbeModel()
-    model.set_device(_get_qq_model().mdevice)
-    _EQ_PROBE_MODEL = model
+    owner = _get_device_owner()
+    driver = owner.driver(ECDriver)
+    model = _EQ_PROBE_MODEL
+    if model is None:
+        model = ProbeModel()
+        _EQ_PROBE_MODEL = model
+    if model.probe_device_key != id(driver):
+        model.set_device(owner.mdevice)
+        model.probe_device_key = id(driver)
+        model.probe_result = None
+    model.probe_payload = None
+    model.probe_event.clear()
     model.driver(ECDriver).custom_eq_query()
-    if not model.probe_event.wait(timeout):
-        return {
-            "supported": None,
-            "error": "设备未返回自定义 EQ 查询结果",
-        }
-    payload = model.probe_payload or []
-    parsed = custom_eq_query_analysis(payload)
-    return {
-        "supported": bool(parsed),
-        "payload": payload,
-        "parsed": parsed,
-    }
+    return model
+
+
+def _probe_custom_eq(timeout=1.5):
+    # Only the HTTP worker waits. Device listeners stay on the GUI thread so
+    # queued USB signals can arrive while the caller is waiting for a result.
+    from interface.client.ec_parse import custom_eq_query_analysis
+    with _EQ_PROBE_LOCK:
+        model = _run_device_job("eq_probe_start")
+        if not model.probe_event.wait(timeout):
+            return {"supported": None, "error": "设备未返回自定义 EQ 查询结果"}
+        payload = list(model.probe_payload or [])
+        parsed = custom_eq_query_analysis(payload)
+        result = {"supported": bool(parsed), "payload": payload, "parsed": parsed}
+        model.probe_result = result
+        return result
 
 
 def _eq_info():
-    model = _get_lyric_model()
+    from driver.edifier_driver import ECDriver
+    model = _get_device_owner()
     device = getattr(model, "mdevice", None)
+    driver = model.driver(ECDriver)
     func_bean = getattr(device, "func_bean", None)
     result = {
         "product_id": getattr(device, "product_id", None),
         "vendor_id": getattr(device, "vendor_id", None),
         "eq_index": getattr(func_bean, "eq", None),
-        "driver_ready": bool(getattr(device, "mdriver", None)),
+        "driver_ready": bool(driver and driver.running and not driver.is_device_deleted),
     }
-    result["custom_eq_probe"] = _probe_custom_eq(1.5)
+    probe = _EQ_PROBE_MODEL
+    result["custom_eq_probe"] = (
+        dict(probe.probe_result)
+        if probe is not None and probe.probe_device_key == id(driver) and probe.probe_result is not None
+        else {"supported": None, "error": "自定义 EQ 能力尚未查询"}
+    )
     return result
 
 
@@ -785,8 +808,8 @@ def _set_eq_preset(index):
     index = int(index)
     if index not in (0, 1, 2):
         raise ValueError("unsupported hardware EQ preset")
-    _get_lyric_model().driver(ECDriver).eq_set([index])
-    return {"preset": index}
+    _get_device_owner().driver(ECDriver).eq_set([index])
+    return {"preset": index, "status": "queued"}
 
 
 def _stop_time_tool_direct():
@@ -843,6 +866,7 @@ def _get_lyric_model():
 
 def _get_pixel_model():
     from PyQt6.QtWidgets import QApplication
+    from app.frame.home.view.device.module_sound_box.sound_box_pixel_model import SoundBoxPixelModel
     from app.frame.home.view.device.module_sound_box_hz.sound_box_pixel_model_hz import (
         SoundBoxPixelModelHz,
     )
@@ -850,7 +874,7 @@ def _get_pixel_model():
     for widget in QApplication.allWidgets():
         for attribute in ("model", "_model"):
             candidate = getattr(widget, attribute, None)
-            if isinstance(candidate, SoundBoxPixelModelHz):
+            if isinstance(candidate, (SoundBoxPixelModel, SoundBoxPixelModelHz)):
                 return candidate
     return None
 
@@ -934,6 +958,8 @@ def _install_protocol_logging():
         return original_option_select(self, option_index, is_need_to_send_data, is_focus)
 
     def received_driver_report(self, report):
+        if _CANVAS_BRIDGE is None:
+            _schedule_device_bridge_start()
         if _DEVICE_DISPLAY is not None:
             _DEVICE_DISPLAY.feed_report(int(getattr(report, "index", -1)),
                                         getattr(report, "payload", []) or [], source=id(self))
@@ -1052,7 +1078,8 @@ def _get_device_owner():
     from PyQt6.QtWidgets import QApplication
     candidates = [_DEVICE_OWNER, _QQ_MODEL]
     if _DEVICE_OWNER is None:
-        candidates.extend(getattr(widget, "model", None) for widget in QApplication.allWidgets())
+        candidates.extend(getattr(widget, attribute, None)
+                          for widget in QApplication.allWidgets() for attribute in ("model", "_model"))
     for owner in candidates:
         device = getattr(owner, "mdevice", None)
         if device is None or getattr(device, "product_id", None) != 0xA160:
@@ -1168,32 +1195,35 @@ class _CanvasBridge(QObject):
             finally:
                 job["done"].set()
             return
-        if job.get("kind") in ("eq_info", "eq_preset"):
+        if job.get("kind") in ("eq_info", "eq_preset", "eq_probe_start", "query_device", "pixel_info", "stop_time_tool"):
             try:
                 if job["kind"] == "eq_info":
-                    from driver.edifier_driver import ECDriver
-                    owner = _get_qq_model()
-                    driver = owner.driver(ECDriver)
-                    job["result"] = {"product_id": getattr(owner.mdevice, "product_id", None),
-                                      "eq_index": getattr(getattr(owner.mdevice, "func_bean", None), "eq", None),
-                                      "driver_ready": bool(driver and driver.running),
-                                      "custom_eq_probe": {"supported": None,
-                                          "error": "当前设备尚无经过验证的自定义 EQ 查询"}}
-                else:
+                    job["result"] = _eq_info()
+                elif job["kind"] == "eq_preset":
                     job["result"] = _set_eq_preset(job["index"])
+                elif job["kind"] == "eq_probe_start":
+                    job["result"] = _begin_custom_eq_probe()
+                elif job["kind"] == "query_device":
+                    _device_transport().send("query")
+                    job["result"] = {"status": "query-sent"}
+                elif job["kind"] == "pixel_info":
+                    model = _get_pixel_model()
+                    time_tool_running = getattr(model, "is_time_tool_running", None)
+                    job["result"] = {
+                        "found": model is not None,
+                        "class": type(model).__name__ if model else None,
+                        "time_tool_running": bool(time_tool_running()) if callable(time_tool_running) else None,
+                        "mode_group_index": getattr(model, "mode_group_index", None),
+                    }
+                else:
+                    if _device_transport().protocol != "ed_canvas":
+                        raise RuntimeError("当前设备未提供该计时工具控制")
+                    job["result"] = _stop_time_tool_direct()
             except Exception as error:
                 job["error"] = str(error)
             finally:
                 job["done"].set()
             return
-        if job.get("kind") == "legacy_ready_probe":
-            from driver.edifier_driver import ECDriver
-            index = int(job.get("device_index", 0))
-            if index not in (0, 1):
-                return False
-            _get_qq_model().driver(ECDriver).pixel_screen_custom_image_set([index, 0, 0, 0, 4, 40])
-            _log("legacy_image_ready_probe_sent", device_index=index)
-            return True
         if job.get("kind") == "device_snapshot":
             try:
                 from driver.edifier_driver import ECDriver
@@ -1284,6 +1314,22 @@ class _CanvasBridge(QObject):
 
 
 _CANVAS_BRIDGE = None
+
+
+def _schedule_device_bridge_start():
+    """Initialize on the GUI thread even when lyrics have never been enabled."""
+    global _CANVAS_BRIDGE
+    from PyQt6.QtCore import QCoreApplication
+    application = QCoreApplication.instance()
+    if application is None:
+        return False
+    with _BRIDGE_START_LOCK:
+        if _CANVAS_BRIDGE is None:
+            bridge = _CanvasBridge()
+            bridge.moveToThread(application.thread())
+            _CANVAS_BRIDGE = bridge
+            bridge.request.emit({"kind": "initialize"})
+    return True
 
 
 def _ensure_canvas_model():
@@ -1499,14 +1545,10 @@ class _LocalApiHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.partition("?")[0] == "/api/device":
-            job = {"kind": "device_snapshot", "done": threading.Event(), "refresh": "refresh=1" in self.path}
-            _CANVAS_JOBS.put(job)
-            if not job["done"].wait(3.0):
-                self._send(504, {"error": "设备线程未响应"})
-            elif job.get("error"):
-                self._send(503, {"error": job["error"]})
-            else:
-                self._send(200, job["result"])
+            try:
+                self._send(200, _run_device_job("device_snapshot", refresh="refresh=1" in self.path))
+            except Exception as error:
+                self._send(503, {"error": str(error)})
             return
         if self.path == "/api/settings":
             self._send(200, _load_settings())
@@ -1591,32 +1633,19 @@ class _LocalApiHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/api/pixel-model":
             try:
-                model = _get_pixel_model()
-                self._send(
-                    200,
-                    {
-                        "found": model is not None,
-                        "class": type(model).__name__ if model else None,
-                        "time_tool_running": (
-                            bool(model.is_time_tool_running()) if model else None
-                        ),
-                        "mode_group_index": getattr(
-                            model, "mode_group_index", None
-                        ),
-                    },
-                )
+                self._send(200, _run_device_job("pixel_info"))
             except Exception as error:
                 self._send(500, {"error": str(error)})
             return
         if self.path == "/api/pixel/end-time-tool":
             try:
-                self._send(202, _stop_time_tool_direct())
+                self._send(202, _run_device_job("stop_time_tool"))
             except Exception as error:
                 self._send(500, {"error": str(error)})
             return
         if self.path == "/api/eq/info":
             try:
-                self._send(200, _eq_info())
+                self._send(200, _run_device_job("eq_info"))
             except Exception as error:
                 self._send(500, {"error": str(error)})
             return
@@ -1625,7 +1654,8 @@ class _LocalApiHandler(BaseHTTPRequestHandler):
                 self._send(
                     200,
                     {
-                        "lyric_model": _lyric_model_state(_get_lyric_model()),
+                        "lyric_model": _display_snapshot().get("lyrics", {}),
+                        "display": _display_snapshot(),
                         "progress": _netease_progress_snapshot(
                             bool(
                                 getattr(_ACTIVE_MONITOR, "_evt_is_playing", None)
@@ -1704,9 +1734,7 @@ class _LocalApiHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/api/diagnose":
             try:
-                model = _get_lyric_model()
-                model.query_pixel_setting()
-                self._send(202, {"status": "query-sent"})
+                self._send(202, _run_device_job("query_device"))
             except Exception as error:
                 self._send(500, {"error": str(error)})
             return
@@ -1743,7 +1771,7 @@ class _LocalApiHandler(BaseHTTPRequestHandler):
         if self.path == "/api/eq/preset":
             try:
                 index = int(payload.get("index", 0))
-                result = _set_eq_preset(index)
+                result = _run_device_job("eq_preset", index=index)
                 _save_settings({"sound_mode": index})
                 self._send(202, result)
             except Exception as error:
@@ -2065,7 +2093,7 @@ def _locate_and_send_lyric(self, provided_position=None):
 
 
 def _start(self):
-    global _ACTIVE_MONITOR, _CANVAS_TIMER, _QQ_MODEL, _CANVAS_BRIDGE, _DEVICE_DISPLAY
+    global _ACTIVE_MONITOR, _QQ_MODEL
     _ACTIVE_MONITOR = self
     callback_owner = getattr(getattr(self, "_on_lyric_changed", None), "__self__", None)
     if callback_owner is not None:
@@ -2074,10 +2102,7 @@ def _start(self):
         self._on_lyric_changed = type(callback_owner)._on_lyric_text_changed.__get__(
             callback_owner, type(callback_owner)
         )
-    if _CANVAS_TIMER is None:
-        if _CANVAS_BRIDGE is None:
-            _CANVAS_BRIDGE = _CanvasBridge()
-        _CANVAS_BRIDGE.initialize()
+    _schedule_device_bridge_start()
     return _original_start(self)
 
 
@@ -2256,10 +2281,6 @@ PixelLyricsMonitor.start = _start
 PixelLyricsMonitor._locate_and_send_lyric = _locate_and_send_lyric
 
 _install_protocol_logging()
-from PyQt6.QtCore import QCoreApplication
-if QCoreApplication.instance() is not None:
-    _CANVAS_BRIDGE = _CanvasBridge()
-    _CANVAS_BRIDGE.moveToThread(QCoreApplication.instance().thread())
-    _CANVAS_BRIDGE.request.emit({"kind": "initialize"})
+_schedule_device_bridge_start()
 _start_netease_progress_bridge()
 _start_local_api()

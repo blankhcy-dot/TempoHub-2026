@@ -1816,7 +1816,8 @@ class SettingsWindow(QMainWindow):
             self.sound_buttons[index].setChecked(True)
             self.sound_curve.set_mode(index)
             self._set_sound_mode_label(index)
-            self._set_chip(self.sound_status, "硬件模式已切换", "good")
+            self.sound_status.setToolTip("")
+            self._set_chip(self.sound_status, "模式设置已发送" if result.get("status") == "queued" else "硬件模式已切换", "good")
         # The preset endpoint already persists sound_mode.
         self.api.post("/api/eq/preset", {"index": index}, applied)
 
