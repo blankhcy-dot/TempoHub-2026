@@ -27,10 +27,12 @@ if ($LASTEXITCODE -ne 0) {
     --onefile `
     --console `
     --name "TempoHub-NetEase-Installer" `
-    --add-data "$root\tools;tools" `
+    --add-data "$root\tools\patch_temphub.py;tools" `
     --add-data "$root\payload;payload" `
-    --add-data "$root\ui;ui" `
-    --add-data "$root\scripts;scripts" `
+    --add-data "$root\ui\lyrics_settings.py;ui" `
+    --add-data "$root\scripts\create_shortcuts.ps1;scripts" `
+    --add-data "$root\scripts\launch_netease_lyrics.ps1;scripts" `
+    --add-data "$root\scripts\uninstall.ps1;scripts" `
     --add-data "$runtime;runtime39" `
     --hidden-import "PyInstaller.archive.readers" `
     --hidden-import "PyInstaller.archive.writers" `

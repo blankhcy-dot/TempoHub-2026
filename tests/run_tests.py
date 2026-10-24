@@ -48,10 +48,11 @@ if os.name == "nt":
             QFontDatabase.addApplicationFont(str(font))
 import test_regressions
 import test_device_display
+import test_startup
 test_regressions.SNAPSHOT_DIR = args.snapshots
 result = unittest.TextTestRunner(verbosity=2).run(
     unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromModule(module)
-                       for module in (test_regressions, test_device_display)))
+                       for module in (test_regressions, test_device_display, test_startup)))
 if result.wasSuccessful() and args.benchmark:
     import benchmark_rendering
     benchmark_rendering.run(args.snapshots)

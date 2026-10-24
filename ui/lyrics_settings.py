@@ -268,21 +268,22 @@ class WindowTitleBar(QWidget):
         self.setFixedHeight(38)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(12, 3, 12, 3)
+        layout.setSpacing(0)
         controls = QHBoxLayout()
         controls.setSpacing(0)
         self.close_button = WindowControl("close", window)
         self.minimize_button = WindowControl("minimize", window)
         self.maximize_button = WindowControl("maximize", window)
-        for button in (self.close_button, self.minimize_button, self.maximize_button):
+        for button in (self.minimize_button, self.maximize_button, self.close_button):
             controls.addWidget(button)
-        layout.addLayout(controls)
+        layout.addSpacing(72)
         layout.addStretch(1)
         caption = QLabel("Halo PixelBar")
         caption.setObjectName("windowCaption")
         caption.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         layout.addWidget(caption)
         layout.addStretch(1)
-        layout.addSpacing(72)
+        layout.addLayout(controls)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -589,31 +590,29 @@ def api_post(path: str, payload: dict, timeout: float = 5.0):
 
 
 def ensure_tempo_hub_running():
-    try:
-        api_get("/api/state", timeout=0.8)
-        return True
-    except Exception:
-        pass
-
     executable = APP_DIR / "EDIFIER TempoHub.exe"
-    if executable.is_file():
-        try:
-            subprocess.Popen(
-                [str(executable)],
-                cwd=str(APP_DIR),
-                close_fds=True,
-            )
-        except Exception:
-            return False
+    if not executable.is_file():
+        return False
+
+    # A --startup instance can serve the API before its main window/device
+    # pages are initialized. A normal launch also wakes that existing instance
+    # through TempoHub's own single-instance handling.
+    try:
+        subprocess.Popen(
+            [str(executable)],
+            cwd=str(APP_DIR),
+            close_fds=True,
+        )
+    except Exception:
+        return False
 
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
-        time.sleep(0.35)
         try:
             api_get("/api/state", timeout=0.8)
             return True
         except Exception:
-            continue
+            time.sleep(0.35)
     return False
 
 
