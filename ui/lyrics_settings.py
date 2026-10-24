@@ -1420,6 +1420,10 @@ class SettingsWindow(QMainWindow):
         preview_layout.addWidget(preview)
         preview_layout.addWidget(self._divider())
         self.audio_metrics = QLabel("等待系统音频")
+        self.audio_display_status = QLabel("等待同步到音响")
+        self.audio_display_status.setObjectName("muted")
+        self.audio_display_status.setWordWrap(True)
+        preview_layout.addWidget(self.audio_display_status)
         self.audio_metrics.setObjectName("lyric")
         preview_layout.addWidget(self.audio_metrics)
         preview_layout.addStretch()
@@ -1589,6 +1593,10 @@ class SettingsWindow(QMainWindow):
         preview = MatrixPreview()
         preview_layout.addWidget(preview)
         preview_layout.addWidget(self._divider())
+        self.performance_display_status = QLabel("等待同步到音响")
+        self.performance_display_status.setObjectName("muted")
+        self.performance_display_status.setWordWrap(True)
+        preview_layout.addWidget(self.performance_display_status)
         metrics_grid = QGridLayout()
         metrics_grid.setSpacing(10)
         self.metric_values = {}
@@ -2244,6 +2252,8 @@ class SettingsWindow(QMainWindow):
             self._progress_sample = None
             for preview in (self.audio_preview, self.notification_preview, self.performance_preview):
                 preview.show_message("DISCONNECTED")
+            self.audio_display_status.setText("音响显示连接已断开")
+            self.performance_display_status.setText("音响显示连接已断开")
             return
         self._poll_failures = 0
         if recovered:
@@ -2293,15 +2303,21 @@ class SettingsWindow(QMainWindow):
 
         lyric_model = state.get("lyric_model") or {}
         if isinstance(display, dict):
-            if display.get("pending"):
+            if display.get("applying", display.get("pending")) or (display.get("pending") and not display.get("verified")):
                 self._set_chip(self.device_chip, "正在更新设备显示", "muted")
                 self._set_chip(self.device_state, "等待音响确认…", "muted")
             elif display.get("last_error"):
                 self._set_chip(self.device_chip, "设备显示待重试", "warn")
                 self._set_chip(self.device_state, display["last_error"], "warn")
             elif display.get("verified"):
-                self._set_chip(self.device_chip, "音响已确认显示", "good")
-                self._set_chip(self.device_state, "设备显示正常", "good")
+                if display.get("continuous_refresh"):
+                    self._set_chip(self.device_chip, "设备画面持续同步", "good")
+                    fps = display.get("content_fps")
+                    text = f"内容推送 {float(fps):.1f} 帧/秒" if fps is not None else "设备显示已连接，正在同步内容"
+                    self._set_chip(self.device_state, text, "good")
+                else:
+                    self._set_chip(self.device_chip, "音响已确认显示", "good")
+                    self._set_chip(self.device_state, "设备显示正常", "good")
             else:
                 self._set_chip(self.device_chip, "等待显示确认", "muted")
                 self._set_chip(self.device_state, "应用场景后显示设备确认结果", "muted")
@@ -2314,6 +2330,23 @@ class SettingsWindow(QMainWindow):
         else:
             self._set_chip(self.device_chip, "设备歌词未开启", "muted")
             self._set_chip(self.device_state, "可点击“重新开启歌词”", "muted")
+
+        for scene, label in (("audio", self.audio_display_status), ("performance", self.performance_display_status)):
+            label.setToolTip("统计音响已确认的图像内容推送，区别于页面预览和屏幕硬件刷新率。")
+            if not isinstance(display, dict) or not display.get("connected"):
+                label.setText("等待音响显示连接")
+            elif display.get("last_error"):
+                label.setText("音响同步待重试 · " + str(display["last_error"]))
+            elif display.get("applying", False):
+                label.setText("正在应用音响显示…")
+            elif display.get("scene") == scene and display.get("verified"):
+                if display.get("continuous_refresh"):
+                    fps = display.get("content_fps")
+                    label.setText("音响画面持续同步" + (f" · 内容推送 {float(fps):.1f} 帧/秒" if fps is not None else ""))
+                else:
+                    label.setText("音响已接收当前画面")
+            else:
+                label.setText("等待音响应用此场景")
 
         widgets = state.get("widgets") or {}
         audio = widgets.get("audio") or {}

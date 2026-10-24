@@ -50,10 +50,11 @@ def parse_legacy_screen(payload):
 
 
 class DisplayRequest:
-    def __init__(self, scene, settings, force=True):
+    def __init__(self, scene, settings, force=True, background=False):
         if scene not in SCENES:
             raise ValueError("未知显示场景")
         self.scene, self.settings, self.force = scene, dict(settings), bool(force)
+        self.background = bool(background)
         self.done = threading.Event()
         self.result, self.error = None, None
 
@@ -95,6 +96,8 @@ class DeviceDisplay:
         self._displayed_performance_style = None
         self._last_error = None
         self._frame_count = 0
+        self._frame_times = deque(maxlen=20)
+        self._auto_refresh_enabled = False
         self._last_latency_ms = None
         self._configuration = None
         self._lyrics_text = None
@@ -122,9 +125,23 @@ class DeviceDisplay:
     def snapshot(self):
         with self._lock:
             native = dict(self._native or {})
+            now = self.clock()
+            frame_age = now - self._frame_times[-1] if self._frame_times else None
+            content_fps = None
+            if len(self._frame_times) > 1:
+                elapsed = self._frame_times[-1] - self._frame_times[0]
+                content_fps = round((len(self._frame_times) - 1) / elapsed, 2) if elapsed > 0 else None
+                if frame_age > max(3.0, (self._last_latency_ms or 0) / 1000 * 2.5):
+                    content_fps = 0.0
+            applying = any(request is not None and not request.background
+                           for request in (self._active, self._pending))
             return {"connected": self._transport is not None,
                     "protocol": "legacy_ec" if self._transport is not None else None,
                     "phase": self._phase, "pending": self._active is not None or self._pending is not None,
+                    "applying": applying,
+                    "continuous_refresh": self._auto_refresh_enabled and self._transport is not None,
+                    "content_fps": content_fps,
+                    "last_frame_age_seconds": round(frame_age, 2) if frame_age is not None else None,
                     "scene": self._displayed_scene, "audio_mode": self._displayed_style,
                     "performance_mode": self._displayed_performance_style,
                     "verified": (self._displayed_scene is not None and self._last_error is None
@@ -141,6 +158,8 @@ class DeviceDisplay:
     def tick(self, settings, auto_refresh=True):
         with self._lock:
             now = self.clock()
+            self._auto_refresh_enabled = bool(auto_refresh and settings.get("enabled", True)
+                                              and settings.get("scene") in ("audio", "performance"))
             try:
                 transport = self.transport_provider()
                 if transport is None:
@@ -153,6 +172,7 @@ class DeviceDisplay:
                     self._last_frame_hash = None
                     self._displayed_scene = None
                     self._configuration = None
+                    self._frame_times.clear()
                     self._last_error = None
                     self._reports.clear()
                     if self._active:
@@ -197,9 +217,13 @@ class DeviceDisplay:
             configuration = self._settings_key(scene, settings)
             if request is None and auto_refresh and now >= self._next_auto_attempt:
                 if configuration != self._configuration or (self._native and not self._home_matches(scene)):
-                    request = DisplayRequest(scene, settings, True)
-                elif scene != "lyrics" and now - self._last_frame_at >= 0.4:
-                    request = DisplayRequest(scene, settings, False)
+                    request = DisplayRequest(scene, settings, True, background=True)
+                elif scene in ("audio", "performance"):
+                    # Schedule from the start of the previous attempt. A slow
+                    # transfer must not incur an extra full interval after ACK.
+                    interval = 0.1 if scene == "audio" else 1.0
+                    if now - self._started_at >= interval:
+                        request = DisplayRequest(scene, settings, False, background=True)
             if request is None:
                 if now >= self._next_status_query:
                     try:
@@ -362,18 +386,23 @@ class DeviceDisplay:
         self._configuration = self._settings_key(request.scene, request.settings)
         self._last_error = None
         self._last_frame_at = self.clock()
-        self._last_latency_ms = round((self._last_frame_at - self._started_at) * 1000, 2)
+        request_latency_ms = round((self._last_frame_at - self._started_at) * 1000, 2)
+        if frame_transmitted:
+            self._last_latency_ms = request_latency_ms
         if self._frame:
             self._last_frame_hash = self._frame_hash
             if frame_transmitted:
                 self._frame_count += 1
+                self._frame_times.append(self._last_frame_at)
         request.result = {"scene": request.scene,
                           "performance_mode": self._displayed_performance_style,
                           "verified": request.scene == "lyrics" or IMAGE_DISPLAY_MAPPING_VERIFIED,
                           "transfer_verified": True, "protocol": "legacy_ec",
-                          "latency_ms": self._last_latency_ms, "frame_bytes": len(self._frame or b"")}
+                          "latency_ms": request_latency_ms, "frame_bytes": len(self._frame or b""),
+                          "frame_transmitted": bool(self._frame and frame_transmitted)}
         request.done.set()
-        self.log("display_confirmed", **request.result)
+        if not request.background or frame_transmitted:
+            self.log("display_confirmed", background=request.background, **request.result)
         self._active = None
         self._phase = "idle"
 

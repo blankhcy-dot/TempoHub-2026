@@ -977,7 +977,11 @@ def _install_protocol_logging():
                       "length": len(data)}
             if index in (257, 258, 259, 232, 238, 239, 23):
                 record["payload"] = list(getattr(parsed, "payload", []) or [])[:64]
-                _log("device_protocol_rx", **record)
+                # Chunk ACKs are frequent during live display. Retain them in
+                # the bounded diagnostic ring without writing every ACK to disk.
+                packet_ack = index == 23 and record["payload"][1:2] == [3]
+                if not packet_ack or os.environ.get("TEMPOHUB_PROTOCOL_TRACE") == "1":
+                    _log("device_protocol_rx", **record)
             with _DEVICE_REPORTS_LOCK:
                 _DEVICE_REPORTS.append(record)
         except Exception:
@@ -1554,10 +1558,11 @@ def _poll_canvas_jobs():
             continue
         _CANVAS_BRIDGE.handle(job)
     try:
-        # Continuous uploads remain disabled until the classic transfer has
-        # been verified on hardware. Explicit requests still run to completion.
         settings = _load_settings()
-        _DEVICE_DISPLAY.tick(settings, auto_refresh=False)
+        # Refresh is owned by the backend, independently of the preview window.
+        # The controller starts the next frame only after the current frame is
+        # acknowledged, and explicit scene requests take priority over refresh.
+        _DEVICE_DISPLAY.tick(settings, auto_refresh=settings.get("scene") in ("audio", "performance"))
         _refresh_notification_display(settings, _DEVICE_DISPLAY.snapshot())
         interval = 10 if _DEVICE_DISPLAY.snapshot()["pending"] else 50
         if _CANVAS_TIMER.interval() != interval:
