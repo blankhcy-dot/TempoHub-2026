@@ -29,7 +29,6 @@ from app.utils import pixel_lyrics_util_orig as _orig
 from app.utils.pixel_lyrics_util_orig import *  # noqa: F401,F403
 from app.utils.pixel_lyrics_util_orig import PixelLyricsMonitor, parse_lrc_to_timeline
 from PyQt6.QtCore import QObject, QTimer, Qt, pyqtSignal, pyqtSlot
-from app.utils.tempo_scene_engine import AUDIO_MODES, PERFORMANCE_MODES, SceneEngine
 from app.utils.tempo_device_display import DeviceDisplay
 
 
@@ -91,10 +90,7 @@ _SCENE_HOME_GENERATION = 0
 _SCENE_PREPARE_REQUIRED = True
 _PIXEL_PROBE_MODEL = None
 _PROTOCOL_LOGGING_INSTALLED = False
-_SCENE_ENGINE = None
 _DEVICE_DISPLAY = None
-_NOTIFICATION_REFRESH = {"revision": None, "submitted_revision": None,
-                         "request": None, "failures": 0, "retry_at": 0.0}
 _DEVICE_OWNER = None
 _EQ_PROBE_MODEL = None
 _EQ_PROBE_LOCK = threading.Lock()
@@ -112,16 +108,6 @@ _SETTINGS_CHECK_AT = 0.0
 _DEFAULT_SETTINGS = {
     "enabled": True,
     "scene": "lyrics",
-    "audio_mode": "bars",
-    "performance_mode": "tiles",
-    "audio_sensitivity": 55,
-    "notify_wechat": True,
-    "notify_qq": True,
-    "notify_qqmail": True,
-    "perf_show_fps": True,
-    "perf_show_cpu": True,
-    "perf_show_gpu": True,
-    "perf_show_memory": True,
     "sound_mode": 0,
     "font_family": "Microsoft YaHei UI",
     "font_size": 22,
@@ -132,6 +118,19 @@ _DEFAULT_SETTINGS = {
     "effect": "scroll",
     "direction": "right_to_left",
 }
+_REMOVED_SETTINGS = (
+    "audio_mode",
+    "audio_sensitivity",
+    "native_audio_mode",
+    "performance_mode",
+    "notify_wechat",
+    "notify_qq",
+    "notify_qqmail",
+    "perf_show_fps",
+    "perf_show_cpu",
+    "perf_show_gpu",
+    "perf_show_memory",
+)
 
 
 def _log(event, **fields):
@@ -196,17 +195,16 @@ def _load_settings():
 
 
 def _normalize_settings(settings):
-    for key, low, high in (("line_offset_ms", -5000, 5000),
-                           ("audio_sensitivity", 20, 100), ("sound_mode", 0, 2)):
+    for key in _REMOVED_SETTINGS:
+        settings.pop(key, None)
+    for key, low, high in (("line_offset_ms", -5000, 5000), ("sound_mode", 0, 2)):
         try:
             settings[key] = max(low, min(high, int(settings.get(key, _DEFAULT_SETTINGS[key]))))
         except (ValueError, TypeError, OverflowError):
             settings[key] = _DEFAULT_SETTINGS[key]
-    for key, choices in (("scene", ("lyrics", "audio", "notifications", "performance")),
-                         ("audio_mode", AUDIO_MODES), ("performance_mode", PERFORMANCE_MODES)):
-        if settings.get(key) not in choices:
-            settings[key] = _DEFAULT_SETTINGS[key]
-    settings["engine"] = "native" if settings.get("scene", "lyrics") == "lyrics" else "custom"
+    if settings.get("scene") != "lyrics":
+        settings["scene"] = "lyrics"
+    settings["engine"] = "native"
     return settings
 
 
@@ -226,7 +224,16 @@ def _save_settings(settings):
             merged.update(settings)
         merged = _normalize_settings(merged)
         if merged == _SETTINGS_CACHE and os.path.isfile(_SETTINGS_PATH):
-            return dict(merged)
+            try:
+                with open(_SETTINGS_PATH, "r", encoding="utf-8") as file:
+                    stored = json.load(file)
+                stale = isinstance(stored, dict) and any(
+                    key in stored for key in _REMOVED_SETTINGS
+                )
+            except (OSError, ValueError):
+                stale = False
+            if not stale:
+                return dict(merged)
         os.makedirs(os.path.dirname(_SETTINGS_PATH), exist_ok=True)
         temporary = _SETTINGS_PATH + ".tmp"
         try:
@@ -242,68 +249,11 @@ def _save_settings(settings):
         stat = os.stat(_SETTINGS_PATH)
         _SETTINGS_STAMP = (stat.st_mtime_ns, stat.st_size)
         _SETTINGS_CHECK_AT = time.monotonic() + 1.0
-        if _SCENE_ENGINE is not None:
-            try:
-                _SCENE_ENGINE.configure(merged)
-            except Exception as error:
-                _log("scene_configure_error", error=str(error))
         return dict(merged)
 
 
-_SCENE_ENGINE = SceneEngine(os.path.dirname(sys.executable), _log)
-_SCENE_ENGINE.configure(_load_settings())
 
 
-def _render_text_matrix(text, font_family, font_size, font_weight=600):
-    from PyQt6.QtCore import QRectF
-    from PyQt6.QtGui import QColor, QFont, QFontMetricsF, QImage, QPainter
-
-    width, height = 256, 32
-    image = QImage(width, height, QImage.Format.Format_Grayscale8)
-    image.fill(QColor("black"))
-    painter = QPainter(image)
-    painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, False)
-    font = QFont(font_family or _DEFAULT_SETTINGS["font_family"])
-    font.setWeight(
-        QFont.Weight.DemiBold if int(font_weight) >= 500 else QFont.Weight.Normal
-    )
-    font.setPixelSize(max(8, min(32, int(font_size))))
-    painter.setFont(font)
-    painter.setPen(QColor("white"))
-    metrics = QFontMetricsF(font)
-    while font.pixelSize() > 8 and metrics.horizontalAdvance(text) > width:
-        font.setPixelSize(font.pixelSize() - 1)
-        painter.setFont(font)
-        metrics = QFontMetricsF(font)
-    painter.drawText(
-        QRectF(0, 0, width, height),
-        int(Qt.AlignmentFlag.AlignCenter.value),
-        text,
-    )
-    painter.end()
-
-    matrix = [[0] * width for _ in range(height)]
-    for y in range(height):
-        for x in range(width):
-            if image.pixelColor(x, y).lightness() > 110:
-                matrix[y][x] = 1
-
-    preview_path = os.path.join(
-        tempfile.gettempdir(), "tempo_hub_lyric_preview.png"
-    )
-    image.scaled(
-        width * 4,
-        height * 4,
-        Qt.AspectRatioMode.IgnoreAspectRatio,
-        Qt.TransformationMode.FastTransformation,
-    ).save(preview_path, "PNG")
-    globals()["_LAST_RENDER"] = {
-        "text": text,
-        "font_family": font.family(),
-        "font_size": font.pixelSize(),
-        "preview_path": preview_path,
-    }
-    return matrix
 
 
 def _parse_clock_seconds(text):
@@ -881,34 +831,6 @@ def _get_pixel_model():
     return None
 
 
-def _ensure_pixel_probe_model():
-    global _PIXEL_PROBE_MODEL
-    if _PIXEL_PROBE_MODEL is not None:
-        return _PIXEL_PROBE_MODEL
-    from app.frame.home.view.device.module_sound_box_hz.sound_box_pixel_model_hz import (
-        SoundBoxPixelModelHz,
-    )
-
-    class PixelProbeModel(SoundBoxPixelModelHz):
-        def receive_data_from_usb(self, report):
-            result = super().receive_data_from_usb(report)
-            if getattr(report, "index", None) == 257:
-                _log(
-                    "pixel_query_response",
-                    time_tool_type=getattr(self, "time_tool_type", None),
-                    time_tool_state=getattr(
-                        self, "time_tool_running_state", None
-                    ),
-                    mode_group_index=getattr(self, "mode_group_index", None),
-                    screen_switch=getattr(self, "screen_switch", None),
-                )
-            return result
-
-    model = PixelProbeModel()
-    model.set_device(_get_qq_model().mdevice)
-    _PIXEL_PROBE_MODEL = model
-    model.init_data()
-    return model
 
 
 def _lyric_model_state(model):
@@ -919,20 +841,6 @@ def _lyric_model_state(model):
     }
 
 
-def _force_native_lyrics(display_mode=1):
-    from driver.edifier_driver import ECDriver
-
-    model = _get_lyric_model()
-    mode_group_index = getattr(model, "mode_group_index", None)
-    if mode_group_index is None:
-        mode_group_index = 1
-    display_mode = int(display_mode or 1)
-    payload = [int(mode_group_index), 3, 0, 1, display_mode]
-    model.driver(ECDriver).hz_pixel_screen_set(payload)
-    model.is_lyric_enabled = True
-    model.lyrics_display_mode = display_mode
-    _log("native_lyrics_enabled", payload=payload)
-    return {"payload": payload, "model": _lyric_model_state(model)}
 
 
 def _install_protocol_logging():
@@ -949,16 +857,6 @@ def _install_protocol_logging():
     original_receive = HzSoundBoxPixelMusicLyricModel.receive_data_from_usb
     original_process = ECDriver._process_report
     original_driver_receive = ECDriver.receive_data_from_usb
-    from app.frame.home.view.device.module_sound_box.view.sound_box_pixel_scene_model import SoundBoxPixelSceneModel
-    original_option_select = SoundBoxPixelSceneModel.set_option_select
-
-    def selected_scene_option(self, option_index, is_need_to_send_data=False, is_focus=False):
-        if _DEVICE_DISPLAY is not None and _DEVICE_DISPLAY.is_image_request_active():
-            # Our EF echoes must not trigger a second, competing vendor image
-            # download through the official scene model.
-            is_need_to_send_data = False
-        return original_option_select(self, option_index, is_need_to_send_data, is_focus)
-
     def received_driver_report(self, report):
         if _CANVAS_BRIDGE is None:
             _schedule_device_bridge_start()
@@ -1049,7 +947,6 @@ def _install_protocol_logging():
     ECDriver.edifier_set_report = logged_report
     ECDriver._process_report = logged_process
     ECDriver.receive_data_from_usb = received_driver_report
-    SoundBoxPixelSceneModel.set_option_select = selected_scene_option
     HzSoundBoxPixelMusicLyricModel.receive_data_from_usb = logged_receive
     _PROTOCOL_LOGGING_INSTALLED = True
 
@@ -1071,8 +968,6 @@ class _DeviceTransport:
             return self.driver.pixel_screen_query()
         if command == "screen":
             return self.driver.pixel_screen_set(payload, is_retry=False)
-        if command == "image":
-            return self.driver.pixel_screen_custom_image_set(payload, is_retry=False)
         if command == "text":
             return self.driver.device_text_set(payload)
         raise ValueError("未知设备操作")
@@ -1107,10 +1002,6 @@ def _device_transport():
     return _DeviceTransport(owner.driver(ECDriver), owner.mdevice)
 
 
-def _device_frame(scene):
-    if _SCENE_ENGINE is None:
-        raise RuntimeError("显示模块正在启动，请稍后重试")
-    return _SCENE_ENGINE.render_matrix(scene)
 
 
 def _device_lyric_text():
@@ -1171,7 +1062,7 @@ class _CanvasBridge(QObject):
         global _CANVAS_TIMER, _DEVICE_DISPLAY
         if _CANVAS_TIMER is not None:
             return
-        _DEVICE_DISPLAY = DeviceDisplay(_device_transport, _device_frame, _device_lyric_text, _log)
+        _DEVICE_DISPLAY = DeviceDisplay(_device_transport, _device_lyric_text, _log)
         _CANVAS_TIMER = QTimer(self)
         _CANVAS_TIMER.setTimerType(Qt.TimerType.PreciseTimer)
         _CANVAS_TIMER.setInterval(10)
@@ -1270,56 +1161,9 @@ class _CanvasBridge(QObject):
             finally:
                 job["done"].set()
             return
-        _log(
-            "canvas_handle_received",
-            text=job.get("text", ""),
-            scene=job.get("scene"),
-        )
-        try:
-            from app.utils.hz_canvas_bin_utils import HzCanvasBinUtils
-
-            _ensure_canvas_model()
-            if _CANVAS_MODEL._is_ed03_running:
-                if time.time() - _CANVAS_LAST_START > 8.0:
-                    _CANVAS_MODEL._is_ed03_running = False
-                    _log("canvas_stale_send_state_reset")
-                else:
-                    raise RuntimeError("画布正在传输上一帧，请稍后再试")
-
-            matrix = job.get("matrix")
-            if matrix is None:
-                matrix = _render_text_matrix(
-                    job.get("text", ""),
-                    job.get("font_family", _DEFAULT_SETTINGS["font_family"]),
-                    job.get("font_size", _DEFAULT_SETTINGS["font_size"]),
-                    job.get("font_weight", _DEFAULT_SETTINGS["font_weight"]),
-                )
-            spec = _CANVAS_MODEL.canvas_matrix_spec
-            if _CANVAS_WALLPAPER_ID is None:
-                file_bytes = HzCanvasBinUtils.matrix_to_bin(matrix, spec)
-                _CANVAS_WALLPAPER_ID = (
-                    HzCanvasBinUtils.get_wallpaper_id_from_bin(file_bytes)
-                )
-            _CANVAS_MODEL.pixel_canvas_send(
-                matrix,
-                set_home_screen=bool(job.get("show", False)),
-                wallpaper_id_override=_CANVAS_WALLPAPER_ID,
-            )
-            globals()["_CANVAS_LAST_START"] = time.time()
-            _log(
-                "canvas_queued",
-                text=job.get("text", ""),
-                scene=job.get("scene"),
-                show=bool(job.get("show", False)),
-                mode_group_index=getattr(_CANVAS_MODEL, "mode_group_index", None),
-                wallpaper_count=len(
-                    getattr(_CANVAS_MODEL, "wallpaper_combo_data", []) or []
-                ),
-            )
-            return True
-        except Exception as error:
-            _log("canvas_error", error=str(error))
-            return False
+        if job.get("done") is not None:
+            job["error"] = "不支持此设备操作"
+            job["done"].set()
 
 
 _CANVAS_BRIDGE = None
@@ -1341,206 +1185,24 @@ def _schedule_device_bridge_start():
     return True
 
 
-def _ensure_canvas_model():
-    global _CANVAS_MODEL, _QQ_MODEL
-    if _CANVAS_MODEL is not None:
-        return _CANVAS_MODEL
-
-    from app.frame.home.view.device.module_sound_box_hz.view.hz_sound_box_pixel_space_canvas_model import (
-        HzSoundBoxPixelSpaceCanvasModel,
-    )
-    from app.frame.home.view.device.module_sound_box_hz.view.hz_sound_box_qq_music_model import (
-        QQMusicModelCache,
-    )
-
-    qq_model = _get_qq_model()
-
-    class _LoggedCanvasModel(HzSoundBoxPixelSpaceCanvasModel):
-        def receive_data_from_usb(self, report):
-            was_running = bool(getattr(self, "_is_ed03_running", False))
-            try:
-                _log(
-                    "canvas_usb",
-                    index=getattr(report, "index", None),
-                    payload=list(getattr(report, "payload", []) or [])[:8],
-                    sending=was_running,
-                )
-            except Exception:
-                pass
-            return super().receive_data_from_usb(report)
-
-    _CANVAS_MODEL = _LoggedCanvasModel()
-    _CANVAS_MODEL.set_device(qq_model.mdevice)
-    _CANVAS_MODEL.query_pixel_setting()
-    _log("canvas_model_initialized")
-    return _CANVAS_MODEL
 
 
-def _ensure_canvas_model_safe():
-    try:
-        features = getattr(_get_qq_model().mdevice, "func_bean", None)
-        if not getattr(getattr(features, "b28", None), "is_support_pixel_screen_feature", False):
-            return
-        _ensure_canvas_model()
-    except Exception as error:
-        _log("canvas_preinit_error", error=str(error))
 
 
-def _ensure_native_lyrics_safe():
-    try:
-        settings = _load_settings()
-        if (
-            settings.get("scene", "lyrics") == "lyrics"
-            and settings.get("engine") == "native"
-        ):
-            if _DEVICE_DISPLAY is not None:
-                _DEVICE_DISPLAY.submit("lyrics", settings, force=True)
-    except Exception as error:
-        _log("native_lyrics_startup_error", error=str(error))
 
 
-def _dispatch_canvas(job):
-    _CANVAS_JOBS.put(job)
-    _log("canvas_dispatch_queued", text=job.get("text", ""))
 
 
-def _prepare_scene_display():
-    global _SCENE_LAST_SEND, _SCENE_SHOW_PENDING, _SCENE_RENDER_NOT_BEFORE
-    global _SCENE_HOME_GENERATION
-    _SCENE_LAST_SEND = 0.0
-    _SCENE_SHOW_PENDING = True
-    _SCENE_RENDER_NOT_BEFORE = time.time() + 0.8
-    try:
-        pixel_model = _get_pixel_model()
-        if pixel_model is None:
-            _log("scene_pixel_model_missing")
-            pixel_model = _ensure_pixel_probe_model()
-            QTimer.singleShot(1400, _finish_pixel_probe)
-            _stop_time_tool_direct()
-        else:
-            running = pixel_model.is_time_tool_running()
-            _log("scene_pixel_model_found", time_tool_running=running)
-            if running:
-                pixel_model.send_end_time_tool()
-                _log("scene_stopped_time_tool")
-    except Exception as error:
-        _log("scene_time_tool_stop_error", error=str(error))
-    try:
-        from driver.edifier_driver import ECDriver
-
-        _get_lyric_model().driver(ECDriver).hz_pixel_screen_set([1, 0, 0])
-        _log("scene_pixel_screen_enabled")
-    except Exception as error:
-        _log("scene_pixel_screen_enable_error", error=str(error))
-    if _CANVAS_MODEL is not None:
-        try:
-            _CANVAS_MODEL._is_ed03_running = False
-            reset = getattr(_CANVAS_MODEL, "_reset_canvas_send_state", None)
-            if reset is not None:
-                reset()
-        except Exception as error:
-            _log("canvas_scene_reset_error", error=str(error))
-    _SCENE_HOME_GENERATION += 1
-    generation = _SCENE_HOME_GENERATION
-
-    for delay in (3.0, 8.0, 15.0, 22.0):
-        QTimer.singleShot(
-            int(delay * 1000),
-            lambda attempt=delay: _commit_scene_home(generation, attempt),
-        )
 
 
-def _finish_pixel_probe():
-    model = _PIXEL_PROBE_MODEL
-    if model is None:
-        return
-    try:
-        try:
-            running = bool(model.is_time_tool_running())
-        except Exception:
-            running = False
-        _log(
-            "pixel_probe_finished",
-            time_tool_running=running,
-            time_tool_type=getattr(model, "time_tool_type", None),
-            time_tool_tone=getattr(model, "time_tool_tone_switch", None),
-            time_tool_mode=getattr(model, "time_tool_time_mode", None),
-            mode_group_index=getattr(model, "mode_group_index", None),
-        )
-        if running:
-            model.send_end_time_tool()
-            _log("scene_stopped_time_tool", mode="probe")
-    except Exception as error:
-        _log("pixel_probe_error", error=str(error))
 
 
-def _commit_scene_home(generation, attempt):
-    if generation != _SCENE_HOME_GENERATION:
-        return
-    try:
-        from driver.edifier_driver import ECDriver
-
-        mode_group = 1
-        if _CANVAS_MODEL is not None:
-            mode_group = getattr(_CANVAS_MODEL, "mode_group_index", None) or 1
-        _get_lyric_model().driver(ECDriver).hz_pixel_wallpaper_set(
-            [int(mode_group), 2, 0]
-        )
-        _log(
-            "scene_home_commit_sent",
-            attempt=attempt,
-            mode_group_index=mode_group,
-        )
-    except Exception as error:
-        _log("scene_home_commit_error", error=str(error))
 
 
-def _cancel_scene_home_commit():
-    global _SCENE_HOME_GENERATION, _SCENE_SHOW_PENDING, _SCENE_PREPARE_REQUIRED
-    _SCENE_HOME_GENERATION += 1
-    _SCENE_SHOW_PENDING = False
-    _SCENE_PREPARE_REQUIRED = False
 
 
-def _request_scene_display():
-    global _SCENE_PREPARE_REQUIRED
-    _SCENE_PREPARE_REQUIRED = True
 
 
-def _refresh_notification_display(settings, display):
-    if _SCENE_ENGINE is None:
-        return
-    notification = _SCENE_ENGINE.notification_display_state()
-    revision = notification["revision"]
-    refresh = _NOTIFICATION_REFRESH
-    request = refresh["request"]
-    if request is not None and request.done.is_set():
-        if request.error:
-            refresh["failures"] += 1
-            refresh["retry_at"] = time.monotonic() + min(8.0, 2.0 ** refresh["failures"])
-        else:
-            refresh["revision"] = refresh["submitted_revision"]
-            refresh["failures"] = 0
-        refresh["request"] = None
-    if settings.get("scene") != "notifications" or not settings.get("enabled", True):
-        refresh["revision"] = None
-        refresh["failures"] = 0
-        return
-    if not display.get("connected"):
-        refresh["revision"] = None
-        refresh["failures"] = 0
-        refresh["retry_at"] = 0.0
-        return
-    if revision != refresh["submitted_revision"]:
-        refresh["failures"] = 0
-        refresh["retry_at"] = 0.0
-    if display.get("scene") != "notifications":
-        refresh["revision"] = None
-    if (refresh["request"] is None and revision != refresh["revision"]
-            and not display.get("pending") and refresh["failures"] < 3
-            and time.monotonic() >= refresh["retry_at"]):
-        refresh["submitted_revision"] = revision
-        refresh["request"] = _DEVICE_DISPLAY.submit("notifications", settings, force=False)
 
 
 def _poll_canvas_jobs():
@@ -1559,11 +1221,7 @@ def _poll_canvas_jobs():
         _CANVAS_BRIDGE.handle(job)
     try:
         settings = _load_settings()
-        # Refresh is owned by the backend, independently of the preview window.
-        # The controller starts the next frame only after the current frame is
-        # acknowledged, and explicit scene requests take priority over refresh.
-        _DEVICE_DISPLAY.tick(settings, auto_refresh=settings.get("scene") in ("audio", "performance"))
-        _refresh_notification_display(settings, _DEVICE_DISPLAY.snapshot())
+        _DEVICE_DISPLAY.tick(settings)
         interval = 10 if _DEVICE_DISPLAY.snapshot()["pending"] else 50
         if _CANVAS_TIMER.interval() != interval:
             _CANVAS_TIMER.setInterval(interval)
@@ -1636,40 +1294,6 @@ class _LocalApiHandler(BaseHTTPRequestHandler):
                     "canvas_packet_index": getattr(
                         _CANVAS_MODEL, "_canvas_packet_index", None
                     ),
-                    "widgets": (
-                        _SCENE_ENGINE.snapshot()
-                        if _SCENE_ENGINE is not None
-                        else {}
-                    ),
-                },
-            )
-            return
-        if self.path == "/api/scene-frame":
-            settings = _load_settings()
-            scene = str(settings.get("scene", "lyrics"))
-            matrix = (
-                _SCENE_ENGINE.render_matrix(scene)
-                if _SCENE_ENGINE is not None
-                else None
-            )
-            packed = bytearray()
-            if matrix:
-                for row in matrix:
-                    for start in range(0, len(row), 8):
-                        value = 0
-                        for bit in range(8):
-                            if start + bit < len(row) and row[start + bit]:
-                                value |= 1 << (7 - bit)
-                        packed.append(value)
-            self._send(
-                200,
-                {
-                    "scene": scene,
-                    "audio_mode": settings.get("audio_mode", "bars"),
-                    "performance_mode": settings.get("performance_mode", "tiles"),
-                    "width": 256,
-                    "height": 32,
-                    "matrix": base64.b64encode(packed).decode("ascii"),
                 },
             )
             return
@@ -1741,8 +1365,6 @@ class _LocalApiHandler(BaseHTTPRequestHandler):
                 }
                 settings = _save_settings(stored_payload)
                 scene = str(settings.get("scene", "lyrics"))
-                if reapply_device and settings == previous_settings and _SCENE_ENGINE is not None:
-                    _SCENE_ENGINE.configure(settings)
                 if settings.get("line_offset_ms") != previous_settings.get("line_offset_ms"):
                     _run_device_job("apply_offset", offset_ms=settings.get("line_offset_ms", 0))
                 display_changed = any(settings.get(key) != previous_settings.get(key)
@@ -1754,14 +1376,6 @@ class _LocalApiHandler(BaseHTTPRequestHandler):
                 else:
                     result["display"] = _display_snapshot()
                 self._send(200, result)
-            except Exception as error:
-                self._send(500, {"error": str(error)})
-            return
-        if self.path == "/api/test-canvas":
-            try:
-                settings = dict(_load_settings(), scene=payload.get("scene", "performance"))
-                result = _apply_device_display(settings)
-                self._send(200, {"display": result})
             except Exception as error:
                 self._send(500, {"error": str(error)})
             return
@@ -1799,31 +1413,6 @@ class _LocalApiHandler(BaseHTTPRequestHandler):
                     ),
                 },
             )
-            return
-        if self.path == "/api/notifications/test":
-            try:
-                incoming_settings = payload.get("settings", {})
-                if not isinstance(incoming_settings, dict):
-                    raise ValueError("通知设置必须为 JSON 对象")
-                previous = _load_settings()
-                updates = {key: value for key, value in incoming_settings.items() if key != "reapply_device"}
-                settings = _save_settings(dict(updates, scene="notifications", enabled=True))
-                if settings.get("line_offset_ms") != previous.get("line_offset_ms"):
-                    _run_device_job("apply_offset", offset_ms=settings.get("line_offset_ms", 0))
-                _SCENE_ENGINE.trigger_notification(
-                    str(payload.get("app") or "微信"),
-                    str(payload.get("text") or "这是一条测试消息"),
-                )
-                display = _apply_device_display(settings)
-                self._send(200, {"status": "shown", "settings": settings, "applied": True, "display": display})
-            except Exception as error:
-                self._send(500, {"error": str(error)})
-            return
-        if self.path == "/api/performance/start-fps":
-            try:
-                self._send(202, _SCENE_ENGINE.start_fps_capture())
-            except Exception as error:
-                self._send(500, {"error": str(error)})
             return
         if self.path == "/api/eq/preset":
             try:
@@ -2172,34 +1761,6 @@ def _patch_qq_lyric_callback(owner):
     def patched(self, lyric_line):
         settings = _load_settings()
         if settings.get("scene", "lyrics") != "lyrics":
-            return
-        if (
-            settings.get("enabled", True)
-            and settings.get("engine") == "custom"
-            and lyric_line
-        ):
-            _dispatch_canvas(
-                {
-                    "text": lyric_line,
-                    "font_family": settings.get(
-                        "font_family", _DEFAULT_SETTINGS["font_family"]
-                    ),
-                    "font_size": settings.get(
-                        "font_size", _DEFAULT_SETTINGS["font_size"]
-                    ),
-                    "font_weight": settings.get(
-                        "font_weight", _DEFAULT_SETTINGS["font_weight"]
-                    ),
-                    "speed": settings.get("speed", _DEFAULT_SETTINGS["speed"]),
-                    "alignment": settings.get(
-                        "alignment", _DEFAULT_SETTINGS["alignment"]
-                    ),
-                    "direction": settings.get(
-                        "direction", _DEFAULT_SETTINGS["direction"]
-                    ),
-                    "show": False,
-                }
-            )
             return
         return original(self, lyric_line)
 

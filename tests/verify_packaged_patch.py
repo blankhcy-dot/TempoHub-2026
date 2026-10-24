@@ -32,7 +32,7 @@ def main():
         if name != target:
             assert patched[name] == payload, "Unexpected module modification: " + name
     payloads = sorted((ROOT / "payload").glob("*.cpython-39.pyc"))
-    assert len(payloads) >= 3, "Missing display transport payload"
+    assert {path.name for path in payloads} == {"pixel_lyrics_util.cpython-39.pyc", "tempo_device_display.cpython-39.pyc"}, "Unexpected native display payload set"
     for path in payloads:
         name = path.name.removesuffix(".cpython-39.pyc")
         expected = path.read_bytes()

@@ -43,7 +43,6 @@ from PyQt6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QCheckBox,
-    QComboBox,
     QFrame,
     QGraphicsDropShadowEffect,
     QGridLayout,
@@ -66,25 +65,6 @@ from PyQt6.QtWidgets import (
 API_BASE = "http://127.0.0.1:47653"
 PREVIEW_WIDTH = 256
 PREVIEW_HEIGHT = 32
-PERFORMANCE_STYLES = (
-    ("tiles", "四格曲线", "四路数据并排显示，曲线帮助观察负载的持续变化。"),
-    ("gauges", "环形仪表", "弧形刻度搭配读数，直观看到处理器和内存的负载。"),
-    ("trends", "全景趋势", "横向铺开历史曲线，适合比较各项指标的变化。"),
-    ("hud", "科幻 HUD", "切角面板和分段能量条，呈现清晰的机甲仪表风格。"),
-    ("focus", "电竞大字", "突出 FPS 大字读数，其余负载以紧凑条形排列。"),
-    ("minimal", "极简数显", "大号数字搭配细线负载条，减少装饰，方便快速读取。"),
-)
-AUDIO_STYLES = (
-    ("bars", "柱状频谱", "经典频段柱形，响应干脆，回落更平滑。"),
-    ("wave", "纯净波形", "用一条连续曲线呈现声音的细节与起伏。"),
-    ("vu", "双 VU 表", "同时查看峰值与平均电平，适合观察声音强弱。"),
-    ("mirror", "双翼镜像", "低频从中心向两侧展开，峰值随节拍回落。"),
-    ("waterfall", "峰值瀑布", "频段变化逐行留下轨迹，形成流动的点阵瀑布。"),
-    ("pulse", "能量脉冲", "多重波纹随音乐起伏，适合鼓点和电子乐。"),
-    ("particles", "粒子星河", "星点和短尾穿行，密度与速度随声音变化。"),
-    ("orbit", "能量核心", "环形轨道围绕脉冲核心，呈现科幻仪表感。"),
-    ("mountains", "霓虹山峦", "多层山脊叠加，展示频段起伏和空间层次。"),
-)
 
 
 APPLE_STYLE = """
@@ -141,7 +121,7 @@ APPLE_STYLE = """
     QPushButton:hover { background:#F4F6F9; border-color:#BCC5D2; }
     QPushButton:pressed { background:#E9EEF5; border-color:#8BB8F0; }
     QPushButton:disabled { color:#A3A8B1; background:#F4F5F7; border-color:#E7E9ED; }
-    QPushButton:focus, QComboBox:focus { border:1px solid #007AFF; }
+    QPushButton:focus { border:1px solid #007AFF; }
     QPushButton#primary {
         background:#007AFF; color:#FFFFFF; border:1px solid #007AFF;
         border-radius:9px; padding:9px 18px;
@@ -163,13 +143,6 @@ APPLE_STYLE = """
     }
     QListWidget#sceneNav::item:hover { background:#E0E5ED; color:#1D1D1F; }
     QListWidget#sceneNav::item:selected { background:#007AFF; color:#FFFFFF; border:1px solid #007AFF; }
-    QComboBox { background:#F9FAFC; color:#333944; border:1px solid #DCDFE6; border-radius:8px; padding:8px 12px; }
-    QComboBox:hover { border-color:#ADC7E8; }
-    QComboBox::drop-down { border:0; width:26px; }
-    QComboBox QAbstractItemView {
-        background:#FFFFFF; color:#333944; selection-background-color:#E7F1FF;
-        selection-color:#0068DE; border:1px solid #DDE2EB; outline:0; padding:6px;
-    }
     QScrollArea { background:transparent; border:0; }
     QScrollBar:vertical { background:transparent; width:7px; margin:5px 0; }
     QScrollBar::handle:vertical { background:#C4C8D0; border-radius:3px; min-height:28px; }
@@ -204,9 +177,6 @@ def scene_icon(kind, color):
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawEllipse(QRectF(7, 17, 5, 4))
         painter.drawEllipse(QRectF(15, 15, 5, 4))
-    elif kind == "audio":
-        for x, height in ((7, 5), (11, 12), (15, 17), (19, 10), (23, 4)):
-            painter.drawLine(QPointF(x - 1, 14 - height / 2), QPointF(x - 1, 14 + height / 2))
     elif kind == "notifications":
         bubble = QPainterPath()
         bubble.addRoundedRect(QRectF(6, 7, 16, 12), 4, 4)
@@ -805,74 +775,6 @@ class LyricPreview(ScaledPreview):
         self.setPixmap(pixmap)
 
 
-class MatrixPreview(ScaledPreview):
-    def __init__(self):
-        super().__init__()
-        self._last_frame = None
-        self._last_message = None
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setStyleSheet(
-            "background:#101114; border:1px solid #20232A; border-radius:14px;"
-        )
-        shadow = QGraphicsDropShadowEffect(self)
-        shadow.setBlurRadius(20)
-        shadow.setOffset(0, 5)
-        shadow.setColor(QColor(25, 35, 55, 28))
-        self.setGraphicsEffect(shadow)
-        self.show_message("LIVE PREVIEW")
-
-    def show_message(self, text):
-        if text == self._last_message:
-            return
-        self._last_message = text
-        self._last_frame = None
-        image = QImage(
-            PREVIEW_WIDTH,
-            PREVIEW_HEIGHT,
-            QImage.Format.Format_Grayscale8,
-        )
-        image.fill(QColor("#020304"))
-        painter = QPainter(image)
-        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, False)
-        font = QFont("Consolas")
-        font.setPixelSize(9)
-        font.setBold(True)
-        painter.setFont(font)
-        painter.setPen(QColor("white"))
-        painter.drawText(
-            QRectF(0, 0, PREVIEW_WIDTH, PREVIEW_HEIGHT),
-            int(Qt.AlignmentFlag.AlignCenter.value),
-            text,
-        )
-        painter.end()
-        self._set_image(image)
-
-    def set_frame(self, encoded):
-        if encoded == self._last_frame:
-            return
-        try:
-            packed = base64.b64decode(encoded or "", validate=True)
-        except Exception:
-            return
-        expected = PREVIEW_WIDTH * PREVIEW_HEIGHT // 8
-        if len(packed) != expected:
-            return
-        # The wire format is already Qt's MSB-first monochrome bitmap.
-        image = QImage(packed, PREVIEW_WIDTH, PREVIEW_HEIGHT,
-                       PREVIEW_WIDTH // 8, QImage.Format.Format_Mono)
-        image.setColorTable([QColor("black").rgb(), QColor("white").rgb()])
-        self._last_frame = encoded
-        self._last_message = None
-        self._set_image(image)
-
-    def _set_image(self, image):
-        pixmap = QPixmap.fromImage(image).scaled(
-            PREVIEW_WIDTH * 2,
-            PREVIEW_HEIGHT * 2,
-            Qt.AspectRatioMode.IgnoreAspectRatio,
-            Qt.TransformationMode.FastTransformation,
-        )
-        self.setPixmap(pixmap)
 
 
 class ToneCurvePreview(ScaledPreview):
@@ -978,16 +880,6 @@ class SettingsWindow(QMainWindow):
             "engine": "native",
             "line_offset_ms": 0,
             "scene": "lyrics",
-            "audio_mode": "bars",
-            "performance_mode": "tiles",
-            "audio_sensitivity": 55,
-            "notify_wechat": True,
-            "notify_qq": True,
-            "notify_qqmail": True,
-            "perf_show_fps": True,
-            "perf_show_cpu": True,
-            "perf_show_gpu": True,
-            "perf_show_memory": True,
             "sound_mode": 0,
         }
         self._suppress_offset_change = False
@@ -996,7 +888,6 @@ class SettingsWindow(QMainWindow):
         self._connected = False
         self._poll_failures = 0
         self._scene_revision = 0
-        self._desired_scene = "lyrics"
         self._edit_revision = 0
         self._close_pending = False
         self._allow_close = False
@@ -1011,20 +902,12 @@ class SettingsWindow(QMainWindow):
         self.offset_apply_timer.setSingleShot(True)
         self.offset_apply_timer.setInterval(400)
         self.offset_apply_timer.timeout.connect(self._apply_offset)
-        self.scene_apply_timer = QTimer(self)
-        self.scene_apply_timer.setSingleShot(True)
-        self.scene_apply_timer.setInterval(250)
-        self.scene_apply_timer.timeout.connect(lambda: self._apply_scene_options(reapply_device=False))
         self._populate_settings()
         self._suppress_scene_change = False
         self.timer = QTimer(self)
         self.timer.setInterval(1000)
         self.timer.timeout.connect(self._refresh_state)
         self.timer.start()
-        self.preview_timer = QTimer(self)
-        self.preview_timer.setInterval(100)
-        self.preview_timer.timeout.connect(self._refresh_scene_preview)
-        self.preview_timer.start()
         self.progress_timer = QTimer(self)
         self.progress_timer.setInterval(80)
         self.progress_timer.timeout.connect(self._animate_progress)
@@ -1163,7 +1046,7 @@ class SettingsWindow(QMainWindow):
         brand_row = QHBoxLayout()
         brand_row.setContentsMargins(6, 0, 2, 14)
         brand_mark = QLabel()
-        brand_mark.setPixmap(scene_icon("audio", "#007AFF").pixmap(QSize(36, 36)))
+        brand_mark.setPixmap(scene_icon("lyrics", "#007AFF").pixmap(QSize(36, 36)))
         brand_mark.setFixedSize(38, 38)
         brand_row.addWidget(brand_mark)
         brand_box = QVBoxLayout()
@@ -1183,9 +1066,6 @@ class SettingsWindow(QMainWindow):
         self.nav.setObjectName("sceneNav")
         self.nav.setIconSize(QSize(24, 24))
         for text, kind, color in (("歌词同步", "lyrics", "#F45C81"),
-                                  ("音频频谱", "audio", "#AF52DE"),
-                                  ("消息通知", "notifications", "#FF9F0A"),
-                                  ("游戏性能", "performance", "#30A9BE"),
                                   ("音效调优", "sound", "#007AFF")):
             self.nav.addItem(QListWidgetItem(scene_icon(kind, color), text))
         self.nav.setCurrentRow(0)
@@ -1347,17 +1227,7 @@ class SettingsWindow(QMainWindow):
         settings_layout.addLayout(actions)
         lyrics_page_layout.addWidget(settings_card, 2)
 
-        self.audio_page, self.audio_preview = self._build_audio_page()
-        self.notification_page, self.notification_preview = (
-            self._build_notification_page()
-        )
-        self.performance_page, self.performance_preview = (
-            self._build_performance_page()
-        )
         self.sound_page = self._build_sound_page()
-        self.pages.addWidget(self.audio_page)
-        self.pages.addWidget(self.notification_page)
-        self.pages.addWidget(self.performance_page)
         self.pages.addWidget(self.sound_page)
 
         self.offset.valueChanged.connect(self._on_offset_changed)
@@ -1368,8 +1238,7 @@ class SettingsWindow(QMainWindow):
         self.nav.currentRowChanged.connect(self._switch_scene)
 
         # Keep every control reachable on smaller displays and at high DPI.
-        for page in (self.lyrics_page, self.audio_page, self.notification_page,
-                     self.performance_page, self.sound_page):
+        for page in (self.lyrics_page, self.sound_page):
             page.setObjectName("scenePage")
             index = self.pages.indexOf(page)
             self.pages.removeWidget(page)
@@ -1385,7 +1254,7 @@ class SettingsWindow(QMainWindow):
         self.feedback.setObjectName("subtitle")
         self.feedback.setWordWrap(True)
         footer.addWidget(self.feedback, 1)
-        matrix_hint = QLabel("256 × 32 点阵预览")
+        matrix_hint = QLabel("音响原生显示")
         matrix_hint.setObjectName("eyebrow")
         footer.addWidget(matrix_hint)
         content_layout.addLayout(footer)
@@ -1394,299 +1263,6 @@ class SettingsWindow(QMainWindow):
         for button in self.findChildren(QPushButton):
             button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.offset.setAccessibleName("歌词时间偏移，单位毫秒")
-        self.audio_sensitivity.setAccessibleName("音频频谱灵敏度")
-
-    def _build_audio_page(self):
-        page = QWidget()
-        layout = QHBoxLayout(page)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(16)
-
-        preview_card = self._card()
-        preview_layout = QVBoxLayout(preview_card)
-        preview_layout.setContentsMargins(26, 22, 26, 22)
-        preview_layout.setSpacing(12)
-        eyebrow = QLabel("系统音频")
-        eyebrow.setObjectName("eyebrow")
-        preview_layout.addWidget(eyebrow)
-        title = QLabel("系统输出预览")
-        title.setObjectName("songTitle")
-        preview_layout.addWidget(title)
-        hint = QLabel("采集 Windows 系统输出，网易云、QQ 音乐和浏览器声音均可使用。")
-        hint.setObjectName("muted")
-        hint.setWordWrap(True)
-        preview_layout.addWidget(hint)
-        preview = MatrixPreview()
-        preview_layout.addWidget(preview)
-        preview_layout.addWidget(self._divider())
-        self.audio_metrics = QLabel("等待系统音频")
-        self.audio_display_status = QLabel("等待同步到音响")
-        self.audio_display_status.setObjectName("muted")
-        self.audio_display_status.setWordWrap(True)
-        preview_layout.addWidget(self.audio_display_status)
-        self.audio_metrics.setObjectName("lyric")
-        preview_layout.addWidget(self.audio_metrics)
-        preview_layout.addStretch()
-        self.audio_status = QLabel("系统音频监听准备中")
-        self.audio_status.setObjectName("chipMuted")
-        preview_layout.addWidget(
-            self.audio_status, 0, Qt.AlignmentFlag.AlignLeft
-        )
-        layout.addWidget(preview_card, 3)
-
-        controls = self._card()
-        controls_layout = QVBoxLayout(controls)
-        controls_layout.setContentsMargins(24, 22, 24, 20)
-        controls_layout.setSpacing(12)
-        control_eyebrow = QLabel("可视化设置")
-        control_eyebrow.setObjectName("eyebrow")
-        controls_layout.addWidget(control_eyebrow)
-        control_title = QLabel("显示样式")
-        control_title.setObjectName("section")
-        controls_layout.addWidget(control_title)
-
-        mode_label = QLabel("频谱模式")
-        mode_label.setObjectName("muted")
-        controls_layout.addWidget(mode_label)
-        self.audio_mode = QComboBox()
-        for key, name, description in AUDIO_STYLES:
-            self.audio_mode.addItem(name, key)
-        controls_layout.addWidget(self.audio_mode)
-        self.audio_style_hint = QLabel(AUDIO_STYLES[0][2])
-        self.audio_style_hint.setObjectName("muted")
-        self.audio_style_hint.setWordWrap(True)
-        controls_layout.addWidget(self.audio_style_hint)
-
-        sensitivity_title = QLabel("灵敏度")
-        sensitivity_title.setObjectName("section")
-        controls_layout.addWidget(sensitivity_title)
-        self.audio_sensitivity_value = QLabel("55")
-        self.audio_sensitivity_value.setObjectName("offsetValue")
-        controls_layout.addWidget(
-            self.audio_sensitivity_value, 0, Qt.AlignmentFlag.AlignLeft
-        )
-        self.audio_sensitivity = QSlider(Qt.Orientation.Horizontal)
-        self.audio_sensitivity.setObjectName("offsetSlider")
-        self.audio_sensitivity.setRange(20, 100)
-        self.audio_sensitivity.setSingleStep(5)
-        controls_layout.addWidget(self.audio_sensitivity)
-        sensitivity_hint = QLabel(
-            "灵敏度越高，小音量时的频谱变化越明显。"
-        )
-        sensitivity_hint.setObjectName("muted")
-        sensitivity_hint.setWordWrap(True)
-        controls_layout.addWidget(sensitivity_hint)
-        controls_layout.addStretch()
-        audio_apply = QPushButton("应用显示")
-        audio_apply.setObjectName("primary")
-        audio_apply.clicked.connect(self._apply_scene_options)
-        controls_layout.addWidget(audio_apply)
-        layout.addWidget(controls, 2)
-
-        self.audio_mode.currentIndexChanged.connect(self._on_audio_mode_changed)
-        self.audio_sensitivity.valueChanged.connect(self._on_audio_sensitivity)
-        return page, preview
-
-    def _build_notification_page(self):
-        page = QWidget()
-        layout = QHBoxLayout(page)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(16)
-
-        preview_card = self._card()
-        preview_layout = QVBoxLayout(preview_card)
-        preview_layout.setContentsMargins(26, 22, 26, 22)
-        preview_layout.setSpacing(12)
-        eyebrow = QLabel("通知预览")
-        eyebrow.setObjectName("eyebrow")
-        preview_layout.addWidget(eyebrow)
-        title = QLabel("微信、QQ 与邮箱通知")
-        title.setObjectName("songTitle")
-        preview_layout.addWidget(title)
-        hint = QLabel("检测到未读消息时，在屏幕顶部显示发送应用和消息摘要。")
-        hint.setObjectName("muted")
-        hint.setWordWrap(True)
-        preview_layout.addWidget(hint)
-        preview = MatrixPreview()
-        preview_layout.addWidget(preview)
-        preview_layout.addWidget(self._divider())
-        self.notification_latest = QLabel("暂无新通知")
-        self.notification_latest.setObjectName("lyric")
-        self.notification_latest.setWordWrap(True)
-        preview_layout.addWidget(self.notification_latest)
-        preview_layout.addStretch()
-        self.notification_status = QLabel("正在连接 Windows 通知")
-        self.notification_status.setObjectName("chipMuted")
-        preview_layout.addWidget(
-            self.notification_status, 0, Qt.AlignmentFlag.AlignLeft
-        )
-        layout.addWidget(preview_card, 3)
-
-        controls = self._card()
-        controls_layout = QVBoxLayout(controls)
-        controls_layout.setContentsMargins(24, 22, 24, 20)
-        controls_layout.setSpacing(12)
-        control_eyebrow = QLabel("通知设置")
-        control_eyebrow.setObjectName("eyebrow")
-        controls_layout.addWidget(control_eyebrow)
-        control_title = QLabel("监听范围")
-        control_title.setObjectName("section")
-        controls_layout.addWidget(control_title)
-        self.notify_wechat = SettingsSwitch("微信")
-        self.notify_qq = SettingsSwitch("QQ")
-        self.notify_qqmail = SettingsSwitch("QQ 邮箱")
-        controls_layout.addWidget(self.notify_wechat)
-        controls_layout.addWidget(self.notify_qq)
-        controls_layout.addWidget(self.notify_qqmail)
-        notification_hint = QLabel(
-            "优先读取 Windows 通知中心；权限不可用时回退到未读窗口标题检测。"
-        )
-        notification_hint.setObjectName("muted")
-        notification_hint.setWordWrap(True)
-        controls_layout.addWidget(notification_hint)
-        controls_layout.addStretch()
-        notification_apply = QPushButton("应用显示")
-        notification_apply.setObjectName("primary")
-        notification_apply.clicked.connect(self._apply_scene_options)
-        controls_layout.addWidget(notification_apply)
-        wechat_test = QPushButton("测试微信通知")
-        qq_test = QPushButton("测试 QQ 通知")
-        mail_test = QPushButton("测试 QQ 邮箱")
-        wechat_test.clicked.connect(
-            lambda: self._test_notification("微信", "你有一条新的微信消息")
-        )
-        qq_test.clicked.connect(
-            lambda: self._test_notification("QQ", "你收到了一条新的 QQ 消息")
-        )
-        mail_test.clicked.connect(
-            lambda: self._test_notification("QQ邮箱", "你收到了一封新邮件")
-        )
-        controls_layout.addWidget(wechat_test)
-        controls_layout.addWidget(qq_test)
-        controls_layout.addWidget(mail_test)
-        layout.addWidget(controls, 2)
-
-        for checkbox in (self.notify_wechat, self.notify_qq, self.notify_qqmail):
-            checkbox.checkStateChanged.connect(self._schedule_scene_apply)
-        return page, preview
-
-    def _build_performance_page(self):
-        page = QWidget()
-        layout = QHBoxLayout(page)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(16)
-
-        preview_card = self._card()
-        preview_layout = QVBoxLayout(preview_card)
-        preview_layout.setContentsMargins(26, 22, 26, 22)
-        preview_layout.setSpacing(12)
-        eyebrow = QLabel("实时性能")
-        eyebrow.setObjectName("eyebrow")
-        preview_layout.addWidget(eyebrow)
-        title = QLabel("电脑性能监控")
-        title.setObjectName("songTitle")
-        preview_layout.addWidget(title)
-        hint = QLabel("选择喜欢的屏幕布局，按需显示 FPS、CPU、GPU 和内存。")
-        hint.setObjectName("muted")
-        hint.setWordWrap(True)
-        preview_layout.addWidget(hint)
-        preview = MatrixPreview()
-        preview_layout.addWidget(preview)
-        preview_layout.addWidget(self._divider())
-        self.performance_display_status = QLabel("等待同步到音响")
-        self.performance_display_status.setObjectName("muted")
-        self.performance_display_status.setWordWrap(True)
-        preview_layout.addWidget(self.performance_display_status)
-        metrics_grid = QGridLayout()
-        metrics_grid.setSpacing(10)
-        self.metric_values = {}
-        for index, (key, name) in enumerate((("fps", "FPS · 帧率"), ("cpu", "CPU · 处理器"),
-                                             ("gpu", "GPU · 显卡"), ("memory", "内存使用率"))):
-            tile = QFrame()
-            tile.setObjectName("metricTile")
-            tile_layout = QVBoxLayout(tile)
-            tile_layout.setContentsMargins(12, 10, 12, 10)
-            tile_layout.setSpacing(3)
-            title_label = QLabel(name)
-            title_label.setObjectName("metricTitle")
-            value_label = QLabel("--" if key == "fps" else "--%")
-            value_label.setObjectName("metricValue")
-            tile_layout.addWidget(title_label)
-            tile_layout.addWidget(value_label)
-            self.metric_values[key] = value_label
-            metrics_grid.addWidget(tile, index // 2, index % 2)
-        preview_layout.addLayout(metrics_grid)
-        self.performance_values = QLabel("GPU 温度 -- °C  ·  CPU 温度 -- °C")
-        self.performance_values.setObjectName("muted")
-        self.performance_values.setWordWrap(True)
-        preview_layout.addWidget(self.performance_values)
-        preview_layout.addStretch()
-        self.performance_status = QLabel("CPU / GPU / 内存采样运行中")
-        self.performance_status.setObjectName("chipMuted")
-        preview_layout.addWidget(
-            self.performance_status, 0, Qt.AlignmentFlag.AlignLeft
-        )
-        layout.addWidget(preview_card, 3)
-
-        controls = self._card()
-        controls_layout = QVBoxLayout(controls)
-        controls_layout.setContentsMargins(24, 22, 24, 20)
-        controls_layout.setSpacing(12)
-        style_title = QLabel("屏幕样式")
-        style_title.setObjectName("section")
-        controls_layout.addWidget(style_title)
-        self.performance_mode = QComboBox()
-        for key, name, _ in PERFORMANCE_STYLES:
-            self.performance_mode.addItem(name, key)
-        controls_layout.addWidget(self.performance_mode)
-        self.performance_style_hint = QLabel(PERFORMANCE_STYLES[0][2])
-        self.performance_style_hint.setObjectName("muted")
-        self.performance_style_hint.setWordWrap(True)
-        controls_layout.addWidget(self.performance_style_hint)
-        self.performance_mode.currentIndexChanged.connect(self._on_performance_mode_changed)
-        metric_options = QGridLayout()
-        self.performance_toggles = {}
-        for index, (key, label) in enumerate((("fps", "FPS"), ("cpu", "CPU"), ("gpu", "GPU"), ("memory", "内存"))):
-            checkbox = QCheckBox(label)
-            checkbox.setChecked(True)
-            checkbox.toggled.connect(self._schedule_scene_apply)
-            self.performance_toggles[key] = checkbox
-            metric_options.addWidget(checkbox, index // 2, index % 2)
-        controls_layout.addLayout(metric_options)
-        controls_layout.addWidget(self._divider())
-        control_eyebrow = QLabel("采集设置")
-        control_eyebrow.setObjectName("eyebrow")
-        controls_layout.addWidget(control_eyebrow)
-        control_title = QLabel("FPS 采集")
-        control_title.setObjectName("section")
-        controls_layout.addWidget(control_title)
-        fps_hint = QLabel(
-            "FPS 由 Intel PresentMon 采集，首次启用会弹出一次 Windows 管理员授权。"
-        )
-        fps_hint.setObjectName("muted")
-        fps_hint.setWordWrap(True)
-        controls_layout.addWidget(fps_hint)
-        self.fps_button = QPushButton("启用 FPS 采集")
-        self.fps_button.clicked.connect(self._start_fps_capture)
-        controls_layout.addWidget(self.fps_button)
-        self.fps_status = QLabel("FPS 尚未启用")
-        self.fps_status.setObjectName("chipMuted")
-        controls_layout.addWidget(self.fps_status)
-        controls_layout.addWidget(self._divider())
-        detail = QLabel(
-            "CPU 和内存约每秒采样；NVIDIA GPU 使用 nvidia-smi。"
-            "CPU 温度在当前驱动不允许普通权限访问时会显示为 --。"
-        )
-        detail.setObjectName("muted")
-        detail.setWordWrap(True)
-        controls_layout.addWidget(detail)
-        controls_layout.addStretch()
-        performance_apply = QPushButton("应用显示")
-        performance_apply.setObjectName("primary")
-        performance_apply.clicked.connect(self._apply_scene_options)
-        controls_layout.addWidget(performance_apply)
-        layout.addWidget(controls, 2)
-        return page, preview
 
     def _build_sound_page(self):
         page = QWidget()
@@ -1830,35 +1406,21 @@ class SettingsWindow(QMainWindow):
         self.api.post("/api/eq/preset", {"index": index}, applied)
 
     def _selected_scene(self):
-        if self.nav.currentRow() >= 4:
-            return self._desired_scene
-        return ("lyrics", "audio", "notifications", "performance")[
-            max(0, min(3, self.nav.currentRow()))
-        ]
-
-    def _schedule_scene_apply(self):
-        if not self._suppress_scene_change and self._settings_loaded:
-            self._edit_revision += 1
-            self.scene_apply_timer.start()
+        return "lyrics"
 
     def _switch_scene(self, row):
-        if row < 0:
+        if not 0 <= row < 2:
             return
         self.pages.setCurrentIndex(row)
-        self.page_title.setText(("歌词同步", "音频频谱", "消息通知", "游戏性能", "音效调优")[row])
-        self.page_subtitle.setText(("让每一句歌词，与此刻同步。", "让桌面上的声音，看得见。",
-                                   "重要消息，抬眼可见。", "关注每一帧，也关注整体表现。",
-                                   "为不同的时刻，找到合适的声音。")[row])
+        self.page_title.setText(("歌词同步", "音效调优")[row])
+        self.page_subtitle.setText(("让每一句歌词，与此刻同步。", "为不同的时刻，找到合适的声音。")[row])
         self._scene_revision += 1
-        if row < 4:
-            self._desired_scene = ("lyrics", "audio", "notifications", "performance")[row]
-        if row == 4:
+        if row == 1:
             self._load_eq_capability()
         elif not self._suppress_scene_change and self._settings_loaded:
             self._apply_scene_options()
 
     def _apply_scene_options(self, _checked=False, on_success=None, reapply_device=True, on_failure=None):
-        self.scene_apply_timer.stop()
         if not self._settings_loaded:
             self.feedback.setText("正在读取设置，连接后可应用场景")
             if on_failure:
@@ -1892,23 +1454,10 @@ class SettingsWindow(QMainWindow):
                       coalesce=None if on_success else "scene-settings")
 
     def _update_active_scene(self, scene):
-        names = {"lyrics": "歌词同步", "audio": "音频频谱",
-                 "notifications": "消息通知", "performance": "游戏性能"}
-        self.nav_state.setText(f"设备场景 · {names.get(scene, scene)}")
+        self.nav_state.setText("设备场景 · " + ("歌词同步" if scene == "lyrics" else "等待确认"))
 
-    def _on_audio_sensitivity(self, value):
-        self.audio_sensitivity_value.setText(str(int(value)))
-        self._schedule_scene_apply()
 
-    def _on_audio_mode_changed(self, index):
-        if 0 <= index < len(AUDIO_STYLES):
-            self.audio_style_hint.setText(AUDIO_STYLES[index][2])
-        self._schedule_scene_apply()
 
-    def _on_performance_mode_changed(self, index):
-        if 0 <= index < len(PERFORMANCE_STYLES):
-            self.performance_style_hint.setText(PERFORMANCE_STYLES[index][2])
-        self._schedule_scene_apply()
 
     def _activate_scene_page(self, row, on_success=None, on_failure=None):
         self._suppress_scene_change = True
@@ -1917,103 +1466,13 @@ class SettingsWindow(QMainWindow):
         self._suppress_scene_change = False
         self._apply_scene_options(on_success=on_success, on_failure=on_failure)
 
-    def _test_notification(self, app_name, text):
-        if not self._settings_loaded:
-            self._set_chip(self.notification_status, "正在读取设置，请稍后重试", "warn")
-            return
-        self.scene_apply_timer.stop()
-        self.offset_apply_timer.stop()
-        self._suppress_scene_change = True
-        try:
-            self.nav.setCurrentRow(2)
-            self.pages.setCurrentIndex(2)
-            self._desired_scene = "notifications"
-        finally:
-            self._suppress_scene_change = False
-        self._edit_revision += 1
-        revision = self._scene_revision
-        edit_revision = self._edit_revision
-        settings = self._settings_payload(reapply_device=True)
-        self._set_chip(self.notification_status, "正在发送测试通知…", "muted")
 
-        def completed(result, error):
-            if not error and not (result.get("display") or {}).get("verified"):
-                error = RuntimeError("音响尚未确认显示通知")
-            if error:
-                self._set_chip(self.notification_status, "测试失败，请重试", "warn")
-                self.notification_status.setToolTip(str(error))
-                return
-            self.settings.update(result.get("settings", {}))
-            self._update_active_scene("notifications")
-            self.notification_latest.setText(f"{app_name} · {text}")
-            self.notification_status.setToolTip("")
-            self._set_chip(self.notification_status, "测试通知已发送", "good")
-            if revision == self._scene_revision and edit_revision == self._edit_revision:
-                self.feedback.setText("音响已确认显示通知，设置已保存")
-        self.api.post("/api/notifications/test", {"app": app_name, "text": text, "settings": settings},
-                      completed, timeout=12.0)
 
-    def _start_fps_capture(self):
-        self.fps_button.setEnabled(False)
-        self._set_chip(self.fps_status, "等待管理员授权…", "muted")
-
-        def completed(result, error):
-            self.fps_button.setEnabled(True)
-            if error:
-                self._set_chip(self.fps_status, "FPS 启动失败，请重试", "warn")
-                self.fps_status.setToolTip(str(error))
-                return
-            status = result.get("status") or "启动中"
-            error = result.get("error")
-            self._set_chip(
-                self.fps_status,
-                error or status,
-                "warn" if error else "good",
-            )
-        self._activate_scene_page(3, on_success=lambda: self.api.post(
-            "/api/performance/start-fps", {}, completed, timeout=60.0, followup=True),
-            on_failure=lambda error: completed(None, error))
-
-    def _refresh_scene_preview(self):
-        row = self.nav.currentRow()
-        if (row not in (1, 2, 3) or not self._connected
-                or not self.isVisible() or self.isMinimized()):
-            return
-        scene = ("lyrics", "audio", "notifications", "performance")[row]
-        audio_mode = self.audio_mode.currentData() if row == 1 else None
-        performance_mode = self.performance_mode.currentData() if row == 3 else None
-        revision = self._scene_revision
-        edit_revision = self._edit_revision
-        preview = (None, self.audio_preview, self.notification_preview, self.performance_preview)[row]
-
-        def received(frame, error):
-            if error or revision != self._scene_revision or edit_revision != self._edit_revision or frame.get("scene") != scene:
-                return
-            if audio_mode is not None and (audio_mode != self.audio_mode.currentData()
-                    or frame.get("audio_mode", audio_mode) != audio_mode):
-                return
-            if performance_mode is not None and (performance_mode != self.performance_mode.currentData()
-                    or frame.get("performance_mode", performance_mode) != performance_mode):
-                return
-            preview.set_frame(frame.get("matrix", ""))
-        self.api.get("/api/scene-frame", received, timeout=1.5)
 
     def _settings_payload(self, reapply_device=False):
-        scene = self._selected_scene()
-        return {
-            "enabled": True,
-            "scene": scene,
-            "engine": "native" if scene == "lyrics" else "custom",
-            "line_offset_ms": self.offset.value(),
-            "audio_mode": self.audio_mode.currentData(),
-            "performance_mode": self.performance_mode.currentData(),
-            **{"perf_show_" + key: checkbox.isChecked() for key, checkbox in self.performance_toggles.items()},
-            "audio_sensitivity": self.audio_sensitivity.value(),
-            "notify_wechat": self.notify_wechat.isChecked(),
-            "notify_qq": self.notify_qq.isChecked(),
-            "notify_qqmail": self.notify_qqmail.isChecked(),
-            "reapply_device": bool(reapply_device),
-        }
+        return {"enabled": True, "scene": self._selected_scene(), "engine": "native",
+                "line_offset_ms": self.offset.value(),
+                "reapply_device": bool(reapply_device)}
 
     def _set_offset(self, milliseconds):
         self._suppress_offset_change = True
@@ -2046,46 +1505,17 @@ class SettingsWindow(QMainWindow):
         self.api.get("/api/settings", loaded)
 
     def _populate_settings(self, select_scene=True):
-        self._desired_scene = self.settings.get("scene", "lyrics")
+        scene = self.settings.get("scene", "lyrics")
+        if scene != "lyrics":
+            self.settings["scene"] = "lyrics"
         self._set_offset(int(self.settings.get("line_offset_ms", 0)))
-        sound_mode = max(
-            0,
-            min(2, int(self.settings.get("sound_mode", 0))),
-        )
-        if hasattr(self, "sound_buttons"):
-            self.sound_buttons[sound_mode].setChecked(True)
-            self.sound_curve.set_mode(sound_mode)
-            self._set_sound_mode_label(sound_mode)
-        scene_index = {
-            "lyrics": 0,
-            "audio": 1,
-            "notifications": 2,
-            "performance": 3,
-        }.get(self.settings.get("scene", "lyrics"), 0)
+        sound_mode = max(0, min(2, int(self.settings.get("sound_mode", 0))))
+        self.sound_buttons[sound_mode].setChecked(True)
+        self.sound_curve.set_mode(sound_mode)
+        self._set_sound_mode_label(sound_mode)
         if select_scene:
-            self.nav.setCurrentRow(scene_index)
-            self.pages.setCurrentIndex(scene_index)
-        audio_index = self.audio_mode.findData(
-            self.settings.get("audio_mode", "bars")
-        )
-        self.audio_mode.setCurrentIndex(max(0, audio_index))
-        performance_index = self.performance_mode.findData(self.settings.get("performance_mode", "tiles"))
-        self.performance_mode.setCurrentIndex(max(0, performance_index))
-        for key, checkbox in self.performance_toggles.items():
-            checkbox.setChecked(bool(self.settings.get("perf_show_" + key, True)))
-        self.audio_sensitivity.setValue(
-            int(self.settings.get("audio_sensitivity", 55))
-        )
-        self.audio_sensitivity_value.setText(
-            str(self.audio_sensitivity.value())
-        )
-        self.notify_wechat.setChecked(
-            bool(self.settings.get("notify_wechat", True))
-        )
-        self.notify_qq.setChecked(bool(self.settings.get("notify_qq", True)))
-        self.notify_qqmail.setChecked(
-            bool(self.settings.get("notify_qqmail", True))
-        )
+            self.nav.setCurrentRow(0)
+            self.pages.setCurrentIndex(0)
 
     def _set_sound_mode_label(self, index):
         details = (
@@ -2137,7 +1567,6 @@ class SettingsWindow(QMainWindow):
 
     def _restore_native(self):
         self._edit_revision += 1
-        self.scene_apply_timer.stop()
         self.offset_apply_timer.stop()
         self.restore_btn.setEnabled(False)
         self.feedback.setText("正在重新开启设备歌词…")
@@ -2157,7 +1586,6 @@ class SettingsWindow(QMainWindow):
                 self._suppress_scene_change = True
                 self.nav.setCurrentRow(0)
                 self._suppress_scene_change = False
-                self._desired_scene = "lyrics"
                 self.feedback.setText("已重新开启设备歌词")
         self.api.post("/api/restore-native", {}, restored, timeout=12.0)
 
@@ -2181,8 +1609,7 @@ class SettingsWindow(QMainWindow):
             label.style().polish(label)
 
     def _has_pending_edits(self):
-        return (self.offset_apply_timer.isActive() or self.scene_apply_timer.isActive()
-                or self.api.has_pending_writes())
+        return self.offset_apply_timer.isActive() or self.api.has_pending_writes()
 
     def _finish_pending_close(self, failed):
         if not self._close_pending:
@@ -2212,21 +1639,16 @@ class SettingsWindow(QMainWindow):
             self._set_content_enabled(False)
             self.close_wait_timer.start()
             pending_offset = self.offset_apply_timer.isActive()
-            pending_scene = self.scene_apply_timer.isActive()
             if pending_offset:
                 self._apply_offset()
-            if pending_scene:
-                self._apply_scene_options(reapply_device=False)
             self.feedback.setText("正在保存设置，完成后关闭…")
             return
         # A second close explicitly exits even if a service is unresponsive.
         self._allow_close = True
         self.close_wait_timer.stop()
         self.timer.stop()
-        self.preview_timer.stop()
         self.progress_timer.stop()
         self.offset_apply_timer.stop()
-        self.scene_apply_timer.stop()
         self.api.close()
         super().closeEvent(event)
 
@@ -2250,10 +1672,6 @@ class SettingsWindow(QMainWindow):
             self._set_chip(self.device_state, "等待 TempoHub 连接", "warn")
             self._set_chip(self.sync_chip, "等待 TempoHub", "warn")
             self._progress_sample = None
-            for preview in (self.audio_preview, self.notification_preview, self.performance_preview):
-                preview.show_message("DISCONNECTED")
-            self.audio_display_status.setText("音响显示连接已断开")
-            self.performance_display_status.setText("音响显示连接已断开")
             return
         self._poll_failures = 0
         if recovered:
@@ -2310,14 +1728,8 @@ class SettingsWindow(QMainWindow):
                 self._set_chip(self.device_chip, "设备显示待重试", "warn")
                 self._set_chip(self.device_state, display["last_error"], "warn")
             elif display.get("verified"):
-                if display.get("continuous_refresh"):
-                    self._set_chip(self.device_chip, "设备画面持续同步", "good")
-                    fps = display.get("content_fps")
-                    text = f"内容推送 {float(fps):.1f} 帧/秒" if fps is not None else "设备显示已连接，正在同步内容"
-                    self._set_chip(self.device_state, text, "good")
-                else:
-                    self._set_chip(self.device_chip, "音响已确认显示", "good")
-                    self._set_chip(self.device_state, "设备显示正常", "good")
+                self._set_chip(self.device_chip, "音响已确认显示", "good")
+                self._set_chip(self.device_state, "设备显示正常", "good")
             else:
                 self._set_chip(self.device_chip, "等待显示确认", "muted")
                 self._set_chip(self.device_state, "应用场景后显示设备确认结果", "muted")
@@ -2330,82 +1742,6 @@ class SettingsWindow(QMainWindow):
         else:
             self._set_chip(self.device_chip, "设备歌词未开启", "muted")
             self._set_chip(self.device_state, "可点击“重新开启歌词”", "muted")
-
-        for scene, label in (("audio", self.audio_display_status), ("performance", self.performance_display_status)):
-            label.setToolTip("统计音响已确认的图像内容推送，区别于页面预览和屏幕硬件刷新率。")
-            if not isinstance(display, dict) or not display.get("connected"):
-                label.setText("等待音响显示连接")
-            elif display.get("last_error"):
-                label.setText("音响同步待重试 · " + str(display["last_error"]))
-            elif display.get("applying", False):
-                label.setText("正在应用音响显示…")
-            elif display.get("scene") == scene and display.get("verified"):
-                if display.get("continuous_refresh"):
-                    fps = display.get("content_fps")
-                    label.setText("音响画面持续同步" + (f" · 内容推送 {float(fps):.1f} 帧/秒" if fps is not None else ""))
-                else:
-                    label.setText("音响已接收当前画面")
-            else:
-                label.setText("等待音响应用此场景")
-
-        widgets = state.get("widgets") or {}
-        audio = widgets.get("audio") or {}
-        if audio.get("error"):
-            self._set_chip(self.audio_status, audio["error"], "warn")
-            self.audio_metrics.setText("系统音频不可用")
-        elif audio.get("levels"):
-            self._set_chip(self.audio_status, "系统音频监听中", "good")
-            self.audio_metrics.setText(
-                f"Peak {float(audio.get('peak_db', -80)):.1f} dB  ·  "
-                f"RMS {float(audio.get('rms_db', -80)):.1f} dB"
-            )
-
-        notifications = widgets.get("notifications") or {}
-        notification_status = notifications.get("status")
-        notification_error = notifications.get("error")
-        latest = notifications.get("latest") or {}
-        if latest:
-            self.notification_latest.setText(
-                f"{latest.get('app', '通知')} · {latest.get('text', '')}"
-            )
-        elif notification_status:
-            self.notification_latest.setText("暂无新通知")
-        if notification_error:
-            self._set_chip(
-                self.notification_status,
-                f"回退到窗口检测：{notification_error}",
-                "warn",
-            )
-        elif notification_status:
-            self._set_chip(
-                self.notification_status,
-                notification_status,
-                "good"
-                if ("监听" in notification_status or "检测" in notification_status)
-                else "muted",
-            )
-
-        performance = widgets.get("performance") or {}
-        fps = performance.get("fps")
-        cpu = performance.get("cpu")
-        gpu = performance.get("gpu")
-        gpu_temp = performance.get("gpu_temp")
-        memory = performance.get("memory")
-        for key, value in (("fps", fps), ("cpu", cpu), ("gpu", gpu), ("memory", memory)):
-            self.metric_values[key].setText(format_metric(value) + ("" if key == "fps" else "%"))
-        self.performance_values.setText(
-            f"GPU 温度 {format_metric(gpu_temp)} °C  ·  "
-            f"CPU 温度 {format_metric(performance.get('cpu_temp'))} °C")
-        fps_status = performance.get("fps_status")
-        fps_error = performance.get("fps_error")
-        if fps_error:
-            self._set_chip(self.fps_status, fps_error, "warn")
-        elif fps_status:
-            self._set_chip(
-                self.fps_status,
-                fps_status,
-                "good" if fps_status == "采集中" else "muted",
-            )
 
     def _animate_progress(self):
         if not self._progress_sample or self.nav.currentRow() != 0 or self.isMinimized():

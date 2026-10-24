@@ -17,7 +17,7 @@ def main():
         subprocess.run([sys.executable, str(Path(__file__).resolve())], env=environment, check=True)
         return
     root = Path(__file__).resolve().parents[1]
-    for name in ("pixel_lyrics_util", "tempo_scene_engine", "tempo_device_display"):
+    for name in ("pixel_lyrics_util", "tempo_device_display"):
         py_compile.compile(
             str(root / "src" / "app" / "utils" / (name + ".py")),
             cfile=str(root / "payload" / (name + ".cpython-39.pyc")),

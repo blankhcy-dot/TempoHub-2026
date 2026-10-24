@@ -1,7 +1,6 @@
 __pycache__/
 *.py[cod]
 !payload/pixel_lyrics_util.cpython-39.pyc
-!payload/tempo_scene_engine.cpython-39.pyc
 !payload/tempo_device_display.cpython-39.pyc
 
 build/

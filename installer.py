@@ -249,16 +249,6 @@ def main() -> int:
         resource_path("scripts") / "uninstall.ps1",
         output / "uninstall.ps1",
     )
-    vendor_source = resource_path("vendor")
-    if vendor_source.is_dir():
-        shutil.copytree(vendor_source, output / "vendor", dirs_exist_ok=True)
-    output_tools = output / "tools"
-    output_tools.mkdir(exist_ok=True)
-    for name in ("PresentMon-2.6.0-x64.exe", "PresentMon.exe"):
-        candidate = resource_path("tools") / name
-        if candidate.is_file():
-            shutil.copy2(candidate, output_tools / name)
-            break
     (output / ".tempo-nexe-install").write_text(
         str(original_exe),
         encoding="utf-8",
