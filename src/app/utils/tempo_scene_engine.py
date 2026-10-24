@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 from collections import deque
+from functools import lru_cache
 from pathlib import Path
 
 from PyQt6.QtCore import QPointF, QRectF, Qt
@@ -26,6 +27,136 @@ AUDIO_BARS = 32
 AUDIO_MODES = ("bars", "wave", "vu", "mirror", "waterfall", "pulse", "particles", "orbit", "mountains")
 PERFORMANCE_MODES = ("tiles", "gauges", "trends", "hud", "focus", "minimal")
 HISTORY_LENGTH = 60
+
+# Authored bitmap glyphs, with explicit empty counters and one-pixel strokes.
+# Keep digits five columns wide so changing values do not shift their spacing.
+_PIXEL_GLYPHS = {
+    " ": "00/00/00/00/00/00/00",
+    "A": "01110/10001/10001/11111/10001/10001/10001",
+    "B": "11110/10001/10001/11110/10001/10001/11110",
+    "C": "01111/10000/10000/10000/10000/10000/01111",
+    "D": "11110/10001/10001/10001/10001/10001/11110",
+    "E": "11111/10000/10000/11110/10000/10000/11111",
+    "F": "11111/10000/10000/11110/10000/10000/10000",
+    "G": "01111/10000/10000/10111/10001/10001/01111",
+    "H": "10001/10001/10001/11111/10001/10001/10001",
+    "I": "111/010/010/010/010/010/111",
+    "J": "00111/00010/00010/00010/00010/10010/01100",
+    "K": "10001/10010/10100/11000/10100/10010/10001",
+    "L": "10000/10000/10000/10000/10000/10000/11111",
+    "M": "10001/11011/10101/10101/10001/10001/10001",
+    "N": "10001/11001/10101/10011/10001/10001/10001",
+    "O": "01110/10001/10001/10001/10001/10001/01110",
+    "P": "11110/10001/10001/11110/10000/10000/10000",
+    "Q": "01110/10001/10001/10001/10101/10010/01101",
+    "R": "11110/10001/10001/11110/10100/10010/10001",
+    "S": "01111/10000/10000/01110/00001/00001/11110",
+    "T": "11111/00100/00100/00100/00100/00100/00100",
+    "U": "10001/10001/10001/10001/10001/10001/01110",
+    "V": "10001/10001/10001/10001/10001/01010/00100",
+    "W": "10001/10001/10001/10101/10101/11011/10001",
+    "X": "10001/10001/01010/00100/01010/10001/10001",
+    "Y": "10001/10001/01010/00100/00100/00100/00100",
+    "Z": "11111/00001/00010/00100/01000/10000/11111",
+    "a": "00000/00000/01110/00001/01111/10001/01111",
+    "b": "10000/10000/10110/11001/10001/10001/11110",
+    "c": "00000/00000/01111/10000/10000/10000/01111",
+    "d": "00001/00001/01101/10011/10001/10001/01111",
+    "e": "00000/00000/01110/10001/11111/10000/01111",
+    "f": "00110/01001/01000/11100/01000/01000/01000",
+    "g": "00000/01111/10001/10001/01111/00001/01110",
+    "h": "10000/10000/10110/11001/10001/10001/10001",
+    "i": "010/000/110/010/010/010/111",
+    "j": "001/000/011/001/001/101/010",
+    "k": "10000/10000/10010/10100/11000/10100/10010",
+    "l": "110/010/010/010/010/010/111",
+    "m": "00000/00000/11010/10101/10101/10101/10101",
+    "n": "00000/00000/10110/11001/10001/10001/10001",
+    "o": "00000/00000/01110/10001/10001/10001/01110",
+    "p": "00000/11110/10001/10001/11110/10000/10000",
+    "q": "00000/01111/10001/10001/01111/00001/00001",
+    "r": "00000/00000/10110/11001/10000/10000/10000",
+    "s": "00000/00000/01111/10000/01110/00001/11110",
+    "t": "01000/01000/11100/01000/01000/01001/00110",
+    "u": "00000/00000/10001/10001/10001/10011/01101",
+    "v": "00000/00000/10001/10001/10001/01010/00100",
+    "w": "00000/00000/10001/10001/10101/10101/01010",
+    "x": "00000/00000/10001/01010/00100/01010/10001",
+    "y": "00000/10001/10001/10001/01111/00001/01110",
+    "z": "00000/00000/11111/00010/00100/01000/11111",
+    "0": "01110/10001/10001/10001/10001/10001/01110",
+    "1": "00100/01100/00100/00100/00100/00100/01110",
+    "2": "01110/10001/00001/00010/00100/01000/11111",
+    "3": "11110/00001/00001/01110/00001/00001/11110",
+    "4": "00010/00110/01010/10010/11111/00010/00010",
+    "5": "11111/10000/10000/11110/00001/00001/11110",
+    "6": "01110/10000/10000/11110/10001/10001/01110",
+    "7": "11111/00001/00010/00100/01000/01000/01000",
+    "8": "01110/10001/10001/01110/10001/10001/01110",
+    "9": "01110/10001/10001/01111/00001/00001/01110",
+    "%": "0100001/1010010/0100100/0001000/0010010/0100101/1000010",
+    ".": "0/0/0/0/0/0/1",
+    ",": "00/00/00/00/00/01/10",
+    ":": "0/0/1/0/0/1/0",
+    ";": "00/00/01/00/00/01/10",
+    "-": "000/000/000/111/000/000/000",
+    "_": "00000/00000/00000/00000/00000/00000/11111",
+    "+": "00000/00100/00100/11111/00100/00100/00000",
+    "=": "00000/00000/11111/00000/11111/00000/00000",
+    "/": "00001/00010/00010/00100/01000/01000/10000",
+    "\\": "10000/01000/01000/00100/00010/00010/00001",
+    "(": "001/010/100/100/100/010/001",
+    ")": "100/010/001/001/001/010/100",
+    "[": "111/100/100/100/100/100/111",
+    "]": "111/001/001/001/001/001/111",
+    "<": "0001/0010/0100/1000/0100/0010/0001",
+    ">": "1000/0100/0010/0001/0010/0100/1000",
+    "!": "1/1/1/1/1/0/1",
+    "?": "01110/10001/00001/00010/00100/00000/00100",
+    "'": "1/1/0/0/0/0/0",
+    '"': "101/101/000/000/000/000/000",
+    "#": "01010/01010/11111/01010/11111/01010/01010",
+    "*": "00000/10101/01110/11111/01110/10101/00000",
+    "@": "01110/10001/10111/10101/10111/10000/01110",
+    "&": "01100/10010/10100/01000/10101/10010/01101",
+    "|": "1/1/1/1/1/1/1",
+    "~": "00000/00000/01001/10110/00000/00000/00000",
+    "°": "010/101/010/000/000/000/000",
+}
+_PIXEL_GLYPHS = {character: tuple(rows.split("/")) for character, rows in _PIXEL_GLYPHS.items()}
+
+
+@lru_cache(maxsize=256)
+def _pixel_glyph_segments(character, scale):
+    rows = _PIXEL_GLYPHS[character]
+    segments = []
+    for y, row in enumerate(rows):
+        if scale == 1:
+            x = 0
+            while x < len(row):
+                if row[x] == "0":
+                    x += 1
+                    continue
+                end = x
+                while end + 1 < len(row) and row[end + 1] == "1":
+                    end += 1
+                segments.append((x, y, end, y))
+                x = end + 1
+            continue
+        for x, bit in enumerate(row):
+            if bit != "1":
+                continue
+            segments.append((x * scale, y * scale, x * scale, y * scale))
+            for dx, dy in ((1, 0), (0, 1), (-1, 1), (1, 1)):
+                nx, ny = x + dx, y + dy
+                if not (0 <= ny < 7 and 0 <= nx < len(row)) or rows[ny][nx] != "1":
+                    continue
+                # Diagonals connect only isolated corners, keeping the insides
+                # of E, B, P and other right-angle glyphs open when enlarged.
+                if dx and dy and (rows[y][nx] == "1" or rows[ny][x] == "1"):
+                    continue
+                segments.append((x * scale, y * scale, nx * scale, ny * scale))
+    return tuple(segments)
 
 
 def _clamp(value, low, high):
@@ -286,11 +417,49 @@ class SceneEngine:
         font = QFont(family)
         font.setPixelSize(int(size))
         font.setBold(bool(bold))
+        font.setKerning(False)
         return font
 
-    def _draw_text(self, painter, x, y, text, size=8, family="Consolas", bold=False):
-        painter.setFont(self._font(size, family, bold))
-        painter.drawText(QPointF(x, y), str(text))
+    def _draw_text(self, painter, x, y, text, size=8, family="Consolas", bold=False,
+                   align="left", max_width=None):
+        text = str(text).replace("\r", " ").replace("\n", " ").replace("\t", " ")
+        scale = max(1, int(size) // 7)
+        spacing = scale
+        fallback = any(character not in _PIXEL_GLYPHS for character in text)
+        font = self._font(size, "Microsoft YaHei UI" if family == "Consolas" else family, False) if fallback else None
+        metrics = QFontMetricsF(font) if fallback else None
+        advances = []
+        for character in text:
+            rows = _PIXEL_GLYPHS.get(character)
+            width = (len(rows[0]) - 1) * scale + 1 if rows is not None else math.ceil(metrics.horizontalAdvance(character))
+            advances.append(max(1, width))
+        width = sum(advances) + max(0, len(text) - 1) * spacing
+        cursor = int(round(x - width / 2 if align == "center" else x))
+        baseline = int(round(y))
+        top = baseline - (6 * scale + 1)
+        painter.save()
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+            painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, False)
+            painter.setPen(QPen(QColor("white"), 1))
+            if max_width is not None:
+                left = x - max_width / 2 if align == "center" else x
+                painter.setClipRect(QRectF(left, 0, max_width, SCREEN_HEIGHT), Qt.ClipOperation.IntersectClip)
+            if font is not None:
+                painter.setFont(font)
+            for character, advance in zip(text, advances):
+                if character in _PIXEL_GLYPHS:
+                    for x1, y1, x2, y2 in _pixel_glyph_segments(character, scale):
+                        if x1 == x2 and y1 == y2:
+                            painter.drawPoint(cursor + x1, top + y1)
+                        else:
+                            painter.drawLine(cursor + x1, top + y1, cursor + x2, top + y2)
+                else:
+                    painter.drawText(QPointF(cursor, baseline), character)
+                cursor += advance + spacing
+        finally:
+            painter.restore()
+        return width
 
     def _draw_audio(self, painter, settings, audio):
         mode = str(settings.get("audio_mode", "bars"))
@@ -464,18 +633,11 @@ class SceneEngine:
     def _draw_notifications(self, painter, settings, state):
         latest = state.get("latest") or {}
         if latest:
-            app_name = str(latest.get("app") or "NOTICE").upper()
+            app_name = str(latest.get("app") or "NOTICE")
+            app_name = {"微信": "WECHAT", "QQ邮箱": "QQ MAIL"}.get(app_name, app_name.upper())
             text = str(latest.get("text") or "")
             self._draw_text(painter, 4, 10, app_name, 7, bold=True)
-            font = QFont("Microsoft YaHei UI")
-            font.setPixelSize(14)
-            font.setBold(True)
-            painter.setFont(font)
-            painter.drawText(
-                QRectF(4, 12, SCREEN_WIDTH - 8, 20),
-                int(Qt.AlignmentFlag.AlignLeft.value | Qt.AlignmentFlag.AlignVCenter.value),
-                text,
-            )
+            self._draw_text(painter, 4, 28, text, 14, max_width=SCREEN_WIDTH - 8)
             return
         self._draw_text(painter, 4, 9, "MESSAGE MONITOR", 8, bold=True)
         enabled = []
@@ -497,6 +659,8 @@ class SceneEngine:
             self._draw_text(painter, 68, 20, "NO METRICS SELECTED", 10, bold=True)
             return
         histories = state.get("history") or {}
+        temperature_row = any(key in ("cpu", "gpu") and state.get(key + "_temp") is not None
+                              for key, _ in entries)
 
         def number(key):
             return _safe_number(state.get(key))
@@ -562,8 +726,8 @@ class SceneEngine:
                 painter.drawArc(QRectF(center - 14, 4, 28, 28), 30 * 16, int(120 * 16 * ratio(key)))
                 painter.save()
                 painter.setClipRect(left, 0, width, 32)
-                self._draw_text(painter, center - 14, 23, text, 10, bold=True)
-                self._draw_text(painter, center - 11, 31, label, 7)
+                self._draw_text(painter, center, 23, text, 14, align="center", max_width=width - 8)
+                self._draw_text(painter, center, 31, label, 7, align="center", max_width=width - 8)
                 painter.restore()
             elif mode == "minimal":
                 if index:
@@ -575,7 +739,7 @@ class SceneEngine:
                 painter.drawPolyline(QPolygonF([QPointF(left + 1, 7), QPointF(left + 7, 1),
                     QPointF(right - 3, 1), QPointF(right - 3, 25), QPointF(right - 9, 31), QPointF(left + 1, 31)]))
                 self._draw_text(painter, left + 8, 9, label, 7, bold=True)
-                self._draw_text(painter, left + 8, 23, text, 12, bold=True)
+                self._draw_text(painter, left + 8, 23, text, 14, max_width=width - 16)
                 for step in range(int(ratio(key) * max(1, (width - 16) // 5))):
                     painter.fillRect(left + 8 + step * 5, 26, 3, 2, QColor("white"))
             else:
@@ -583,10 +747,11 @@ class SceneEngine:
                     painter.drawLine(left, 1, left, 31)
                 heading = label + " " + text
                 temperature = state.get(key + "_temp") if key in ("cpu", "gpu") else None
-                if temperature is not None:
-                    heading += " " + _safe_number(temperature) + "C"
-                self._draw_text(painter, left + 3, 8, heading, 7, bold=True)
-                rect = QRectF(left + 2, 11, width - 5, 19)
+                self._draw_text(painter, left + 3, 8, heading, 7, max_width=width - 6)
+                if temperature_row and temperature is not None:
+                    self._draw_text(painter, left + 3, 17, _safe_number(temperature) + "°C", 7, max_width=width - 6)
+                chart_top = 19 if temperature_row else 11
+                rect = QRectF(left + 2, chart_top, width - 5, 30 - chart_top)
                 painter.drawRect(rect)
                 graph(key, rect.adjusted(1, 1, -1, -1))
         return
